@@ -301,38 +301,6 @@ def test_chat_cannot_be_asked_to_search_outside_the_docs_corpus(web_client):
     assert fake_client.recall.await_args.kwargs["datasets"] == ["web:demo:docs"]
 
 
-def test_closing_the_page_distils_the_conversation(web_client):
-    """Once, when the visitor leaves. Distilling per turn wrote a fresh lesson
-    about the same material every time: four turns left fourteen lessons
-    covering about three facts."""
-    client, fake_client = web_client
-    fake_client.remember = AsyncMock(return_value=None)
-
-    body = client.post("/api/chat/end", json={"conversation_id": "c1", "visitor_id": "v1"}).json()
-
-    assert body["distilling"] is True
-    call = fake_client.remember.await_args
-    # A session id is what makes cognee run the improve behind it.
-    assert call.kwargs["session_id"] == "web:demo:v1:c1"
-    assert call.kwargs["dataset_name"] == "web:demo:conversations"
-    assert call.kwargs["run_in_background"] is True
-
-
-def test_closing_the_page_distils_nothing_for_a_visitor_who_opted_out(web_client):
-    """Nothing was stored, so there is no session to read - and asking would
-    claim an opt-out that did not hold."""
-    client, fake_client = web_client
-    fake_client.remember = AsyncMock(return_value=None)
-
-    body = client.post(
-        "/api/chat/end",
-        json={"conversation_id": "c1", "visitor_id": "v1", "opt_in": False},
-    ).json()
-
-    assert body["distilling"] is False
-    fake_client.remember.assert_not_awaited()
-
-
 def test_forget_endpoint_clears_conversation(web_client):
     test_client, fake = web_client
     resp = test_client.post("/api/forget", json={"conversation_id": "c1"})

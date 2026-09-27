@@ -212,7 +212,35 @@ declared content type.
 
 ---
 
-## 12. Smaller friction
+## 12. Deleting a dataset holds the request open until it is gone
+
+`POST /v1/forget` with a dataset runs the whole delete inside the request. On `dev`
+the handler awaits `forget()` and only then responds; unlike `remember` and
+`improve` there is no `run_in_background`, and nothing to poll.
+
+Clearing `web:demo:docs` — about 35k nodes, 25k of them the `topoteretes/cognee`
+code graph — took longer than our client's 120-second timeout. The request failed
+on our side while cognee carried on and finished: the dataset was gone from the
+listing and from platform.cognee.ai, but the dashboard reported an error.
+
+**Our side, needs fixing.** `dashboard_clear` drops its cached graph summary only
+after `forget_dataset` returns, so the timeout skipped it and the repositories panel
+kept showing the deleted code graph for up to 15 minutes. Its docstring is also
+wrong: it says cognee "accepts the delete and drains the dataset behind it", which
+is not what the endpoint does. The fix is to drop the cache whatever the outcome,
+give the delete a timeout of several minutes, and report a timeout as "cognee may
+still be deleting" rather than as a failure.
+
+**Impact.** A client cannot tell a failed delete from a slow one. It has to either
+wait an unknown time or guess, and whatever it caches about the dataset goes stale
+either way.
+
+**Suggested fix.** Accept the delete and return at once, with a pipeline run or
+status the client can poll — as `remember` and `improve` already offer.
+
+---
+
+## 13. Smaller friction
 
 - **`remember(session_id=…)` writes no document of its own.** It is purely a
   trigger for the bridge; the text passed to it does not become an item. Two
@@ -235,7 +263,7 @@ declared content type.
 
 ---
 
-## 13. Things that worked well, and are worth keeping
+## 14. Things that worked well, and are worth keeping
 
 - **The content hash is already exposed.** `rawDataLocation` ends in
   `text_<md5>.txt`, and the digest is the md5 of the stored bytes — verified on all

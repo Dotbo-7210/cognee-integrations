@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -189,9 +189,9 @@ async def _append_to_transcript(conversation, question: str, answer: str) -> Non
     paid for a full improve. A file we own has neither problem: what is in it is
     what was said.
 
-    Nothing here triggers distillation any more. Lessons come from
-    improve(session_ids=...), which reads the session cache and can be called
-    whenever, rather than from a remember() on every answer.
+    Nothing here triggers distillation. Lessons come from improve(session_ids=...),
+    which reads the session cache and is run from the dashboard's Distil button
+    (``/api/dashboard/distil``), rather than from a remember() on every answer.
     """
     dataset = adapter.conversations_dataset(conversation.site_id)
     name = conversation.session_id
@@ -200,15 +200,6 @@ async def _append_to_transcript(conversation, question: str, answer: str) -> Non
             await _write_turn(dataset, name, question, answer)
     except Exception as error:  # noqa: BLE001 - the answer is already out
         print(f"[web_widget] appending to the transcript failed: {error}")
-
-    # Then distil, on the session cognee has been accumulating through recall.
-    # Separate from the transcript write and not inside its lock: the two are
-    # independent, and a failed distillation must not cost us the turn.
-    #
-    # The curator reads the session's whole timeline each run, not just what is
-    # new, so running per turn does not fragment what a lesson is drawn from -
-    # it only means the earliest runs see a shorter conversation. The watermark
-    # decides which candidates may become lessons, so nothing is distilled twice.
 
 
 async def _write_turn(dataset: str, name: str, question: str, answer: str) -> None:
@@ -279,73 +270,6 @@ async def chat(req: ChatRequest, background: BackgroundTasks) -> JSONResponse:
         # the work is owned by the request and cannot be dropped on shutdown.
         background.add_task(_append_to_transcript, conversation, req.message, answer.text)
     return JSONResponse(answer.as_dict())
-
-
-class EndSessionRequest(BaseModel):
-    conversation_id: str
-    visitor_id: str = "anonymous"
-    site_id: str = DEMO_SITE_ID
-    opt_in: bool = True
-
-
-async def _distil_session(conversation) -> None:
-    """Distil this conversation, now that it looks finished.
-
-    remember() with a session id is the trigger: cognee launches the improve
-    run behind it, which reads the session cache and writes lessons.
-
-    Once per conversation rather than once per turn, and that is the whole
-    point of doing it here. The curator reads the session's entire timeline on
-    every run, so running after each turn produced a fresh lesson about the same
-    material each time - a four-turn conversation left fourteen lessons covering
-    about three facts. Waiting until the visitor has gone gives one pass over
-    one finished conversation.
-    """
-    dataset = adapter.conversations_dataset(conversation.site_id)
-    try:
-        await adapter.client.remember(
-            f"End of conversation {conversation.session_id}",
-            dataset_name=dataset,
-            session_id=conversation.session_id,
-            run_in_background=True,
-            filename=f"{conversation.session_id}-end",
-        )
-    except Exception as error:  # noqa: BLE001 - nobody is waiting on this
-        print(f"[web_widget] distilling {conversation.session_id} failed: {error}")
-
-
-@app.post("/api/chat/end")
-async def chat_end(request: Request, background: BackgroundTasks) -> JSONResponse:
-    """The visitor closed the page: distil what the conversation taught.
-
-    Sent by the widget as a beacon on pagehide, so it is fire-and-forget by
-    nature - it cannot be awaited, retried, or reported on. A conversation whose
-    browser crashed, or was force-quit, or backgrounded on a phone that never
-    fired the event, is simply never distilled; its turns stay in the transcript
-    either way.
-
-    Nothing is distilled for a visitor who opted out, for the same reason
-    nothing was stored: there is no session to read.
-    """
-    # The body is read by hand rather than declared as a model, because this
-    # arrives from navigator.sendBeacon and a beacon cannot survive a CORS
-    # preflight. Declaring JSON means the widget must send application/json,
-    # which is not a simple content type, so the browser sends an OPTIONS, the
-    # page finishes unloading, and the POST is never made - the preflight
-    # arrived and returned 200 eleven times while not one beacon did. Sent as
-    # text/plain there is no preflight, and the payload is still JSON.
-    try:
-        req = EndSessionRequest.model_validate_json(await request.body())
-    except Exception:  # noqa: BLE001 - a malformed beacon is not worth a 500
-        raise HTTPException(status_code=400, detail="expected a JSON body") from None
-
-    if not req.opt_in:
-        return JSONResponse({"distilling": False, "why": "opted out"})
-    conversation = adapter.conversation(
-        site_id=req.site_id, visitor_id=req.visitor_id, conversation_id=req.conversation_id
-    )
-    background.add_task(_distil_session, conversation)
-    return JSONResponse({"distilling": True, "session_id": conversation.session_id})
 
 
 @app.post("/api/forget")
@@ -1293,6 +1217,107 @@ async def dashboard_clear_conversations(
     if not await adapter.client.forget_dataset(dataset):
         raise HTTPException(status_code=502, detail="cognee refused to clear the dataset")
     return JSONResponse({"cleared": dataset})
+
+
+# The last distillation run this process started, read back by the dashboard.
+# cognee's improve reports a pipeline status rather than what each stage did, so
+# this is the only account of the run there is: which sessions were asked, and
+# how each request went. Per-process, like the transcript cache.
+_distil_run: dict = {"running": False}
+
+
+async def _distil_all(dataset_id: str, session_ids: list[str]) -> None:
+    """Ask cognee to improve each session in turn, a couple at a time.
+
+    One request per session rather than one for all of them: distillation runs
+    inside the request, so a single call over every conversation would sit open
+    far past any timeout, and one session's held lock would skip the lot.
+    """
+    limit = asyncio.Semaphore(2)
+
+    async def one(session_id: str) -> None:
+        async with limit:
+            try:
+                outcome = await adapter.client.improve_session(session_id, dataset_id=dataset_id)
+            except Exception as error:  # noqa: BLE001 - one session must not stop the rest
+                print(f"[web_widget] improving {session_id} failed: {error}")
+                outcome = "failed"
+        _distil_run["outcomes"][outcome] = _distil_run["outcomes"].get(outcome, 0) + 1
+
+    try:
+        await asyncio.gather(*(one(s) for s in session_ids))
+    finally:
+        _distil_run["running"] = False
+        _distil_run["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+@app.post("/api/dashboard/distil")
+async def dashboard_distil(
+    background: BackgroundTasks, token: Optional[str] = Query(default=None)
+) -> JSONResponse:
+    """Distil every saved conversation - each transcript in the dataset.
+
+    Deciding what is pending is left to cognee. Each improve stage keeps a
+    per-session watermark, so a conversation already distilled, or one that
+    produced nothing worth keeping, is skipped without an LLM call, and one that
+    has grown since its last run is distilled for its new turns only.
+
+    Only sessions still in cognee's session cache can be distilled - that is
+    what distillation reads. A conversation whose session has expired keeps its
+    transcript, but there is nothing left to distil it from.
+    """
+    _require_dashboard(token)
+    if _distil_run["running"]:
+        raise HTTPException(status_code=409, detail="a distillation run is already in progress")
+
+    dataset = adapter.conversations_dataset(DEMO_SITE_ID)
+    datasets = await adapter.client.list_datasets()
+    match = next((d for d in datasets if isinstance(d, dict) and d.get("name") == dataset), None)
+    if not match:
+        return JSONResponse({"dataset": dataset, "exists": False, "sessions": 0})
+
+    # The saved conversations are the transcripts in this dataset, one document
+    # per conversation, named by its session id. cognee's session list is not
+    # the same thing: it holds every session any recall ever opened - probes,
+    # empty ones, conversations from before the dataset was last cleared - and
+    # clearing the dataset does not remove them. Distilling from that list ran
+    # improve over twenty-three sessions for one stored conversation.
+    prefix = f"web:{DEMO_SITE_ID}:"
+    items = await adapter.client.dataset_data(str(match.get("id")))
+    saved = {
+        str(_field(i, "name")) for i in items if str(_field(i, "name")).startswith(prefix)
+    }
+    # Distillation reads the session cache, not the transcript, so a saved
+    # conversation whose session has gone has nothing left to distil from.
+    live = {str(_field(s, "session_id")) for s in await adapter.client.list_sessions()}
+    session_ids = sorted(saved & live)
+    expired = len(saved - live)
+    if not session_ids:
+        return JSONResponse(
+            {"dataset": dataset, "exists": True, "sessions": 0, "expired": expired}
+        )
+
+    _distil_run.clear()
+    _distil_run.update(
+        {
+            "running": True,
+            "sessions": len(session_ids),
+            "expired": expired,
+            "outcomes": {},
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    background.add_task(_distil_all, str(match.get("id")), session_ids)
+    return JSONResponse(
+        {"dataset": dataset, "exists": True, "sessions": len(session_ids), "expired": expired}
+    )
+
+
+@app.get("/api/dashboard/distil")
+async def dashboard_distil_status(token: Optional[str] = Query(default=None)) -> JSONResponse:
+    """How the last distillation run this process started is going."""
+    _require_dashboard(token)
+    return JSONResponse(_distil_run)
 
 
 @app.get("/api/dashboard/ingest-progress")

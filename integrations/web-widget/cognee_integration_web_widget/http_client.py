@@ -406,6 +406,32 @@ class CogneeHttpClient:
         items = data.get("sessions", data.get("results", data)) if isinstance(data, dict) else data
         return list(items) if isinstance(items, list) else []
 
+    async def improve_session(self, session_id: str, *, dataset_id: str) -> str:
+        """Run cognee's improve over one session, distillation included.
+
+        Returns ``"started"``, ``"busy"`` when another improve of this session
+        holds its lock (cognee answers ``{}`` and skips), or ``"failed"``.
+
+        Distillation runs inside the request even with ``run_in_background``,
+        which only detaches the cognify that follows it, so this can take
+        minutes. Each stage keeps a per-session watermark, so a session with
+        nothing new since its last run costs no LLM calls.
+        """
+        response = await self._request(
+            "POST",
+            "/api/v1/improve",
+            json={
+                "dataset_id": dataset_id,
+                "session_ids": [session_id],
+                "run_in_background": True,
+            },
+            timeout_override=420.0,
+        )
+        if response.status_code >= 400:
+            return "failed"
+        data = response.json()
+        return "busy" if isinstance(data, dict) and not data else "started"
+
     async def session_detail(self, session_id: str) -> dict:
         """One session, including its ``qas`` — both sides of each exchange."""
         from urllib.parse import quote
