@@ -30,6 +30,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - `scripts/install-cursor-hooks.py`: writes the same hooks, with absolute paths,
   into `~/.cursor/hooks.json` or a project's `.cursor/hooks.json` (the latter also
   runs in cloud agents); idempotent, merges with existing hooks, `--uninstall`.
+- Cursor CLI status line: `scripts/cognee_statusline_render.py` (the Claude Code
+  renderer on Cursor's state: health glyph, dataset · mode, credits, recall hits and
+  session activation, update nudge) behind `scripts/cognee-statusline.sh`;
+  `scripts/_statusline_config.py` registers it in `~/.cursor/cli-config.json` on
+  `sessionStart` without touching a user's own `statusLine` (`COGNEE_STATUSLINE=false`
+  opts out). `session-context-lookup.py` writes the per-conversation recall marker
+  (`recall/<conversation id>.json`) the bar reads, so several terminals each show
+  their own counts. The plain-text `render_status_for_host` header stays for the IDE.
 - Root `.cursor-plugin/marketplace.json` listing this plugin, so the repository can
   be imported as a Cursor (team) marketplace or submitted to the Cursor Marketplace,
   like `.claude-plugin/marketplace.json` for Claude Code; its version is checked by

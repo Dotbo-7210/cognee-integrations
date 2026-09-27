@@ -1788,6 +1788,13 @@ async def _run_bootstrap(bootstrap: dict) -> None:
 
 
 async def _start(payload: dict | None = None) -> dict:
+    # Cursor CLI status line: register scripts/cognee-statusline.sh in
+    # ~/.cursor/cli-config.json (never over a user's own line; opt out with
+    # COGNEE_STATUSLINE=false). The IDE has no status line, so this is a no-op
+    # there beyond the config write.
+    from _statusline_config import ensure_statusline_configured
+
+    ensure_statusline_configured(hook_log)
     config = load_config()
     payload = payload or {}
     cwd = str(payload.get("cwd") or os.environ.get("CURSOR_CWD") or os.getcwd())

@@ -371,6 +371,8 @@ def test_runtime_copy_tracks_the_codex_runtime(plugin_root):
         "run-cursor-hook",
         "run-cursor-hook.cmd",
         "install-cursor-hooks.py",
+        # Cursor CLI status line registration (the renderer itself is shared).
+        "_statusline_config.py",
     }
     extra = {p.name for p in SCRIPTS_DIR.iterdir() if p.is_file()} - {
         p.name for p in CODEX_SCRIPTS.iterdir()
@@ -402,3 +404,191 @@ def test_shell_helpers_are_executable(plugin_root):
         pytest.skip("POSIX bits")
     for path in sorted(SCRIPTS_DIR.glob("*.sh")) + [SCRIPTS_DIR / "cognee-plugin", POSIX_LAUNCHER]:
         assert path.stat().st_mode & stat.S_IXUSR, f"{path.name} lost its executable bit"
+
+
+# --------------------------------------------------------------------------- #
+# Cursor CLI status line
+# --------------------------------------------------------------------------- #
+
+STATUSLINE_SH = SCRIPTS_DIR / "cognee-statusline.sh"
+STATUSLINE_RENDER = SCRIPTS_DIR / "cognee_statusline_render.py"
+STATUSLINE_CONFIG = SCRIPTS_DIR / "_statusline_config.py"
+CONVERSATION = "11111111-2222-3333-4444-555555555555"
+
+
+@pytest.fixture
+def statusline_config(plugin_root: Path):
+    module = _load(STATUSLINE_CONFIG, "cursor_statusline_config")
+    try:
+        yield module
+    finally:
+        sys.modules.pop("cursor_statusline_config", None)
+
+
+def _render(home: Path, ctx: dict, env: dict | None = None) -> subprocess.CompletedProcess:
+    """Run the launcher exactly as the Cursor CLI does: spawn, JSON on stdin."""
+    run_env = {k: v for k, v in os.environ.items() if not k.startswith("COGNEE_")}
+    run_env.update({"HOME": str(home), "PATH": os.environ.get("PATH", "")})
+    run_env.update(env or {})
+    return subprocess.run(
+        [str(STATUSLINE_SH)],
+        input=json.dumps(ctx),
+        capture_output=True,
+        text=True,
+        env=run_env,
+        timeout=20,
+        check=False,
+    )
+
+
+def _plain(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def test_statusline_launcher_execs_the_cursor_renderer(plugin_root):
+    text = STATUSLINE_SH.read_text(encoding="utf-8")
+    assert text.startswith("#!/bin/sh")
+    assert "cognee_statusline_render.py" in text
+    assert "python3" in text and "exec" in text
+    render = STATUSLINE_RENDER.read_text(encoding="utf-8")
+    assert '"cursor"' in render and '"claude-code"' not in render
+    assert ".claude" not in render, "renderer must not read Claude Code's settings"
+    assert "cli-config.json" in render
+
+
+def test_statusline_renders_from_cursor_state_without_network(plugin_root, tmp_path):
+    home = tmp_path / "home"
+    state = home / ".cognee-plugin" / "cursor"
+    (state / "recall").mkdir(parents=True)
+    (state / "sessions").mkdir()
+    (home / ".cognee").mkdir()
+    (home / ".cognee" / ".env").write_text("", encoding="utf-8")
+    (state / "sessions" / f"{CONVERSATION}.json").write_text(
+        json.dumps({"dataset": "team_memory"}), encoding="utf-8"
+    )
+    marker = {
+        "session_key": CONVERSATION,
+        "hits": {"session": 2, "trace": 1, "graph_context": 0, "code": 1},
+        "saves_last_turn": {"prompt": 1, "trace": 3, "answer": 1},
+        "session_totals": {"turns": 5, "turns_with_hits": 4},
+    }
+    (state / "recall" / f"{CONVERSATION}.json").write_text(json.dumps(marker), encoding="utf-8")
+
+    ctx = {"session_id": CONVERSATION, "cwd": str(tmp_path), "workspace": {"current_dir": "x"}}
+    result = _render(home, ctx)
+    assert result.returncode == 0, result.stderr
+    line = _plain(result.stdout)
+    assert "cognee: team_memory · local" in line
+    assert "4 memory hits" in line
+    assert "4/5 turns had hits this session" in line
+
+    # Another terminal's counts never appear on this bar.
+    other = _render(home, {"session_id": "someone-else", "cwd": str(tmp_path)})
+    assert "memory hit" not in _plain(other.stdout)
+    assert "cognee: agent_sessions · local" in _plain(other.stdout)
+
+    # Garbage on stdin is not fatal: the CLI keeps the bar.
+    broken = subprocess.run(
+        [str(STATUSLINE_SH)],
+        input="not json",
+        capture_output=True,
+        text=True,
+        env={"HOME": str(home), "PATH": os.environ.get("PATH", "")},
+        timeout=20,
+        check=False,
+    )
+    assert broken.returncode == 0 and "cognee:" in _plain(broken.stdout)
+
+
+def test_statusline_config_writes_only_when_safe(statusline_config, tmp_path, monkeypatch):
+    monkeypatch.delenv("COGNEE_STATUSLINE", raising=False)
+    monkeypatch.delenv("COGNEE_STATUSLINE_TIMEOUT_MS", raising=False)
+    monkeypatch.delenv("COGNEE_STATUSLINE_PADDING", raising=False)
+    path = tmp_path / "cli-config.json"
+    events: list[tuple[str, dict]] = []
+    log = lambda event, detail: events.append((event, detail))  # noqa: E731
+
+    # Fresh file: created, other keys untouched, command is the absolute launcher.
+    path.write_text(json.dumps({"version": 1, "permissions": {"allow": ["Shell(ls)"]}}))
+    assert statusline_config.ensure_statusline_configured(log, config_path=path) == "configured"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    assert config["permissions"] == {"allow": ["Shell(ls)"]} and config["version"] == 1
+    entry = config["statusLine"]
+    assert entry["type"] == "command"
+    assert Path(shlex.split(entry["command"])[0]) == STATUSLINE_SH.resolve()
+    assert "timeoutMs" not in entry and "padding" not in entry
+    assert events[-1][0] == "statusline_configured"
+
+    # Idempotent.
+    assert statusline_config.ensure_statusline_configured(log, config_path=path) == "unchanged"
+
+    # A user's own status line is never replaced.
+    path.write_text(json.dumps({"statusLine": {"type": "command", "command": "~/mine.sh"}}))
+    outcome = statusline_config.ensure_statusline_configured(log, config_path=path)
+    assert outcome == "user_statusline_exists"
+    assert json.loads(path.read_text())["statusLine"]["command"] == "~/mine.sh"
+    assert events[-1] == ("statusline_setup_skipped", {"reason": "user_statusline_exists"})
+
+    # Our own stale entry (plugin moved) is updated in place.
+    stale = {"type": "command", "command": "/old/scripts/cognee-statusline.sh"}
+    path.write_text(json.dumps({"statusLine": stale, "model": "x"}))
+    assert statusline_config.ensure_statusline_configured(log, config_path=path) == "configured"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    assert config["model"] == "x" and "/old/" not in config["statusLine"]["command"]
+
+    # Opt out by env; removal only touches our entry.
+    monkeypatch.setenv("COGNEE_STATUSLINE", "false")
+    assert (
+        statusline_config.ensure_statusline_configured(log, config_path=path) == "disabled_by_env"
+    )
+    assert statusline_config.remove_statusline(path) is True
+    assert "statusLine" not in json.loads(path.read_text())
+    path.write_text(json.dumps({"statusLine": {"type": "command", "command": "~/mine.sh"}}))
+    assert statusline_config.remove_statusline(path) is False
+
+    # Missing file is created; tuning knobs land as the CLI expects them.
+    monkeypatch.delenv("COGNEE_STATUSLINE")
+    monkeypatch.setenv("COGNEE_STATUSLINE_TIMEOUT_MS", "3500")
+    monkeypatch.setenv("COGNEE_STATUSLINE_PADDING", "2")
+    fresh = tmp_path / "nested" / "cli-config.json"
+    assert statusline_config.ensure_statusline_configured(log, config_path=fresh) == "configured"
+    entry = json.loads(fresh.read_text())["statusLine"]
+    assert entry["timeoutMs"] == 3500 and entry["padding"] == 2
+
+
+def test_statusline_config_skips_when_the_launcher_is_missing(statusline_config, tmp_path):
+    outcome = statusline_config.ensure_statusline_configured(
+        config_path=tmp_path / "cli-config.json", plugin_root=tmp_path / "nowhere"
+    )
+    assert outcome == "script_not_found"
+    assert not (tmp_path / "cli-config.json").exists()
+
+
+def test_session_start_registers_the_status_line(plugin_root):
+    text = (SCRIPTS_DIR / "session-start.py").read_text(encoding="utf-8")
+    assert "from _statusline_config import ensure_statusline_configured" in text
+    assert "ensure_statusline_configured(hook_log)" in text
+
+
+def test_renderer_keeps_the_plain_text_header_the_hooks_import(plugin_root, tmp_path):
+    """session-start.py / session-context-lookup.py import render_status_for_host
+    for the in-context header; it must stay importable and ANSI-free."""
+    home = tmp_path / "home"
+    (home / ".cognee").mkdir(parents=True)
+    (home / ".cognee" / ".env").write_text("", encoding="utf-8")
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[1]);"
+        "from cognee_statusline_render import render_status_for_host as r;"
+        "print(r('abc'))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(SCRIPTS_DIR)],
+        capture_output=True,
+        text=True,
+        env={"HOME": str(home), "PATH": os.environ.get("PATH", "")},
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cognee: agent_sessions · local"
+    assert "\x1b" not in result.stdout

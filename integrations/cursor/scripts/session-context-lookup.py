@@ -714,22 +714,29 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
 
             _state = _Path.home() / ".cognee-plugin" / "cursor" / "last_recall.json"
         _state.parent.mkdir(parents=True, exist_ok=True)
-        _state.write_text(
-            json.dumps(
-                {
-                    "session_id": session_id,
-                    "session_key": _session_key,
-                    "ts": __import__("datetime")
-                    .datetime.now(__import__("datetime").timezone.utc)
-                    .isoformat(timespec="seconds"),
-                    "hits": counts,
-                    "per_scope": per_scope,
-                    "saves_last_turn": saves_last_turn,
-                    "session_totals": _totals,
-                }
-            ),
-            encoding="utf-8",
+        _payload = json.dumps(
+            {
+                "session_id": session_id,
+                "session_key": _session_key,
+                "ts": __import__("datetime")
+                .datetime.now(__import__("datetime").timezone.utc)
+                .isoformat(timespec="seconds"),
+                "hits": counts,
+                "per_scope": per_scope,
+                "saves_last_turn": saves_last_turn,
+                "session_totals": _totals,
+            }
         )
+        _state.write_text(_payload, encoding="utf-8")
+        # Per-session copy for the Cursor CLI status line (recall/<conversation
+        # id>.json): with several terminals open the shared file only holds the
+        # counts of whoever prompted last, so every other bar would show nothing
+        # or a neighbour's numbers. The renderer trusts this copy's totals.
+        _key_safe = bool(_session_key) and all(c.isalnum() or c in "._-" for c in _session_key)
+        if _key_safe:
+            _per = _state.parent / "recall" / f"{_session_key}.json"
+            _per.parent.mkdir(parents=True, exist_ok=True)
+            _per.write_text(_payload, encoding="utf-8")
     except Exception as exc:
         hook_log("last_recall_write_failed", {"error": str(exc)[:200]})
 

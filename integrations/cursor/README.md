@@ -121,10 +121,24 @@ python3 ~/.cursor/plugins/local/cognee-memory/scripts/doctor.py --json   # or th
 
 `hook.log` shows `store.session_key` with `"source": "payload.session_id"` for each hook, `trace.stored` after tool calls and `stop.stored` after an answer. Cursor's own **Hooks** output channel (Cmd+Shift+P → *Hooks*) shows every hook launch and any error. The next prompt's context begins with the `Cognee memory: … memory hits …` header.
 
+## Status line (Cursor CLI)
+
+In the Cursor CLI (`cursor-agent` / `agent`) the plugin draws the same status line as the Claude Code plugin above the prompt:
+
+```
+● cognee: agent_sessions · local · 5 memory hits · 12/40 turns had hits this session
+```
+
+The glyph is the connection/LLM-key health (green `●`, red `✕ …` with the reason), then the dataset and mode, cloud credits when applicable, this turn's recall hits with the session's activation ratio, and an amber `⬆ Cognee update available` when one is.
+
+It is registered on the first `sessionStart`: `scripts/_statusline_config.py` writes `statusLine` into `~/.cursor/cli-config.json` pointing at `scripts/cognee-statusline.sh` of the running plugin copy (the CLI spawns the command directly, without a shell). A `statusLine` you configured yourself is never replaced; the plugin's own entry is updated in place when the plugin moves and removed again by the renderer when the plugin folder is gone. Knobs: `COGNEE_STATUSLINE=false` opts out, `COGNEE_STATUSLINE_TIMEOUT_MS` / `COGNEE_STATUSLINE_PADDING` map to the CLI's `timeoutMs` / `padding`, `COGNEE_STATUSLINE_COUNTS=full|false` switches the recall segment to the per-scope strip or hides it. The renderer is pure-local (state files under `~/.cognee-plugin/cursor/`, no network). Register it by hand with `python3 scripts/_statusline_config.py` (`--remove` to undo); restart the CLI session to pick up a new `cli-config.json`.
+
+The Cursor IDE has no status line. There, the same text (without ANSI) is the first line of the context the plugin injects on each prompt, so the agent can relay it.
+
 ## Known limitations
 
-- **Windows is untested.** `scripts/run-cursor-hook.cmd` exists, but the plugin's `hooks/hooks.json` uses the POSIX launcher; on Windows use `install-cursor-hooks.py`, which picks the `.cmd`.
-- **No user-facing notices.** Cursor has no channel for a non-blocking hook message. Notices the other plugins show as a `systemMessage` (memory off, update available) are appended to the model's context as `[cognee notice] …` so the agent can relay them.
+- **Windows is untested.** `scripts/run-cursor-hook.cmd` exists, but the plugin's `hooks/hooks.json` uses the POSIX launcher; on Windows use `install-cursor-hooks.py`, which picks the `.cmd`. The status line launcher is POSIX-only too.
+- **No user-facing notices in the IDE.** Cursor has no channel for a non-blocking hook message. Notices the other plugins show as a `systemMessage` (memory off, update available) are appended to the model's context as `[cognee notice] …` so the agent can relay them; in the CLI the status line shows the same states.
 - **`preCompact` cannot inject context** in Cursor, so the memory anchor the Claude Code plugin injects before compaction is not available; the hook still defers the sync.
 - **Cloud agents** run project hooks only: `sessionStart`/`sessionEnd` do not fire there, so recall starts on the first prompt and the graph sync relies on the idle watcher and the `stop` path.
 - **Cursor's Claude Code compatibility layer** can load the *Claude Code* Cognee plugin's hooks too (Settings → Agents → Third-Party Imports). Running both against the same conversation captures everything twice; pick one.
