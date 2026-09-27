@@ -227,7 +227,7 @@
       var data = await res.json();
       addMsg("bot", data.answer || "…");
       addCitations(data.citations);
-      unsent += 1;
+      setUnsent(unsent + 1);
     } catch (e) {
       addMsg("bot", "Sorry — I couldn't reach memory right now.");
     }
@@ -242,10 +242,81 @@
   // fire-and-forget by design: no response, no retry. A tab that crashes or is
   // force-quit never sends it and that conversation is never distilled - the
   // transcript is written per turn and is unaffected either way.
-  var unsent = 0;
-  function endConversation() {
+  //
+  // The count lives in sessionStorage, next to the conversation id, because the
+  // conversation outlives the page: a reload or a link to another docs page
+  // keeps it going. Held in a variable it reset on every page, so a question
+  // asked before navigating was never distilled if the visitor closed the tab
+  // without asking another.
+  function readUnsent() {
+    try {
+      return parseInt(sessionStorage.getItem("cognee_unsent_turns"), 10) || 0;
+    } catch (e) {
+      return 0;
+    }
+  }
+  function setUnsent(n) {
+    unsent = n;
+    try {
+      sessionStorage.setItem("cognee_unsent_turns", String(n));
+    } catch (e) {
+      /* storage blocked: the count lives as long as this page does */
+    }
+  }
+  var unsent = readUnsent();
+
+  // pagehide cannot tell a closed tab from a reload or a click to another page
+  // of the site, and both of those carry the conversation on. Distilling there
+  // ran the curator over a conversation that was still going, and again at
+  // every page after. So note when the page is about to be replaced by one
+  // that continues the conversation, and let only the other departures through.
+  var stayingAt = 0;
+  function staying() {
+    stayingAt = Date.now();
+  }
+  function isStaying() {
+    // Bounded, because a navigation can be noted and then never happen: a
+    // handler cancels it, or it is a download. Left open, that would swallow
+    // the real close later on.
+    return Date.now() - stayingAt < 10000;
+  }
+  if (window.navigation && navigation.addEventListener) {
+    navigation.addEventListener("navigate", function (e) {
+      // Same-document navigations are the docs' own client-side routing; the
+      // page is not going anywhere and pagehide will not fire.
+      if (e.destination.sameDocument) return;
+      var sameSite = false;
+      try {
+        sameSite = new URL(e.destination.url).origin === window.location.origin;
+      } catch (err) {
+        /* unparseable: treat it as leaving */
+      }
+      if (sameSite || e.navigationType === "reload") staying();
+    });
+  }
+  // Where the Navigation API is missing: same-site links, checked after the
+  // page's own handlers so a click the router took over does not count.
+  window.addEventListener("click", function (e) {
+    if (e.defaultPrevented) return;
+    var a = e.target && e.target.closest && e.target.closest("a[href]");
+    if (!a || a.target === "_blank" || a.hasAttribute("download")) return;
+    if (a.origin === window.location.origin) staying();
+  });
+  // A reload from the browser's own button reaches neither of the above; the
+  // keyboard shortcuts at least are catchable.
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "F5" || ((e.metaKey || e.ctrlKey) && (e.key === "r" || e.key === "R"))) {
+      staying();
+    }
+  });
+
+  function endConversation(e) {
+    // persisted: the page went into the back/forward cache and can come back
+    // as it was, conversation and all. That is not the conversation ending.
+    if (e && e.persisted) return;
+    if (isStaying()) return;
     if (!unsent || !optIn) return;
-    unsent = 0;
+    setUnsent(0);
     try {
       navigator.sendBeacon(
         API + "/api/chat/end",
@@ -267,7 +338,7 @@
       /* leaving anyway */
     }
   }
-  // pagehide only. visibilitychange fired on every tab switch, and each one
+  // pagehide only, filtered above to the page actually closing. visibilitychange fired on every tab switch, and each one
   // distilled the whole accumulated conversation again: three of them over a
   // ten-turn thread wrote thirty-five lessons in a minute, all restating the
   // same few facts. Reading a docs page means switching tabs constantly, so
