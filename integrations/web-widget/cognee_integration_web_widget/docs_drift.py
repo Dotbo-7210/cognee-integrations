@@ -60,6 +60,21 @@ def content_digest(text: str) -> str:
     return hashlib.md5(text.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
+def recorded_path(item: dict) -> Optional[str]:
+    """The source path ingest stored on this item, if it stored one.
+
+    Authoritative where present: the item name loses a trailing extension to
+    cognee, so reversing it is a reconstruction, while this is what was actually
+    read. Absent on anything ingested before it started being recorded, which is
+    why the reconstruction below still exists.
+    """
+    if not isinstance(item, dict):
+        return None
+    external = item.get("externalMetadata") or {}
+    path = external.get("widget_path") if isinstance(external, dict) else None
+    return str(path) if path else None
+
+
 def _candidate_paths(name: str) -> list:
     """The paths an item's name could have come from, likeliest first.
 
@@ -73,12 +88,12 @@ def _candidate_paths(name: str) -> list:
     return [relative] + [relative + extension for extension in _EXTENSIONS]
 
 
-def _source_file(root: Path, name: str) -> Optional[Path]:
+def _source_file(root: Path, name: str, path: Optional[str] = None) -> Optional[Path]:
     """The file an ingested item came from, if it still exists."""
-    for candidate in _candidate_paths(name):
-        path = root / candidate
-        if path.is_file():
-            return path
+    for candidate in ([path] if path else []) + _candidate_paths(name):
+        found = root / candidate
+        if found.is_file():
+            return found
     return None
 
 
@@ -135,7 +150,7 @@ def drift_for_items(items: list, docs_path: Optional[str], docs_url: Optional[st
 
     states: dict[str, str] = {}
     matched = drifted = removed = 0
-    absent: list[tuple[str, str]] = []
+    absent: list[tuple[str, str, Optional[str]]] = []
 
     for item in items:
         if not isinstance(item, dict):
@@ -145,9 +160,10 @@ def drift_for_items(items: list, docs_path: Optional[str], docs_url: Optional[st
         if not name:
             continue
 
-        file = _source_file(root, name)
+        path = recorded_path(item)
+        file = _source_file(root, name, path)
         if file is None:
-            absent.append((item_id, name))
+            absent.append((item_id, name, path))
             continue
 
         stored = stored_digest(item)
@@ -168,10 +184,11 @@ def drift_for_items(items: list, docs_path: Optional[str], docs_url: Optional[st
 
     if absent:
         seen = _paths_git_has_seen(root)
-        for item_id, name in absent:
+        for item_id, name, path in absent:
             # Same spellings the lookup above tried, or a deleted .py would be
             # called foreign for the reason a present one used to be.
-            if any(candidate in seen for candidate in _candidate_paths(name)):
+            candidates = ([path] if path else []) + _candidate_paths(name)
+            if any(candidate in seen for candidate in candidates):
                 states[item_id] = "removed"
                 removed += 1
             else:

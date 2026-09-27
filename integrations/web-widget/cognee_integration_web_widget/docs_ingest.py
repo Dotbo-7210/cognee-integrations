@@ -25,10 +25,27 @@ _IMPORTS = re.compile(r"^import\s+.*$", re.M)
 MARKDOWN_SUFFIXES = (".md", ".mdx")
 
 
+def upload_filename(relative_path: str) -> str:
+    """The filename to upload ``relative_path`` under: a/b/c.py -> a__b__c.py.
+
+    The path flattened, extension and all. Nothing is appended: cognee reads a
+    file's extension by sniffing its bytes, not from the name it arrived under,
+    so the ``.md`` this used to add never reached the stored record - every item
+    is ``extension: txt`` regardless - and only served to keep the real suffix
+    inside the item name, where it did not belong.
+    """
+    return relative_path.replace("/", "__")
+
+
 def item_name(relative_path: str) -> str:
-    """The flattened name the corpus uses: a/b/c.mdx -> a__b__c."""
-    stem = re.sub(r"\.(mdx|md)$", "", relative_path)
-    return stem.replace("/", "__")
+    """The name cognee will give this upload: a/b/c.py -> a__b__c.
+
+    cognee strips a single trailing extension from the filename to make the
+    name, so this predicts that rather than working around it. Two files whose
+    paths differ only by extension therefore collide, which the caller checks
+    for - it cannot be resolved here.
+    """
+    return re.sub(r"\.[^./]+$", "", upload_filename(relative_path))
 
 
 def render_for_ingest(source: str, relative_path: str, docs_url: Optional[str] = None) -> str:

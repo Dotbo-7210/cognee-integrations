@@ -914,6 +914,9 @@ def _ingested(root, relative, docs_url=None):
     return {
         "id": relative,
         "name": item_name(relative),
+        # Recorded the way ingest records it: the name loses the extension to
+        # cognee, so the path it came from only survives here.
+        "externalMetadata": {"widget_path": relative},
         "rawDataLocation": f"s3://bucket/tenant/data/text_{digest}.txt",
     }
 
@@ -1064,6 +1067,29 @@ def test_drift_tells_a_deleted_code_file_from_one_that_was_never_there(tmp_path)
     out = drift_for_items(items + [{"id": "seed", "name": "message"}], str(tmp_path))
     assert out["states"]["script.py"] == "removed"
     assert out["states"]["seed"] == "foreign"
+
+
+def test_drift_still_reads_an_item_ingested_before_paths_were_recorded(tmp_path):
+    """The corpus predates external_metadata: those items carry the extension
+    inside the name instead, and reversing it is the only way to place them."""
+    from cognee_integration_web_widget.docs_drift import content_digest, drift_for_items
+    from cognee_integration_web_widget.docs_ingest import render_for_ingest
+
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "old.py").write_text("legacy")
+    digest = content_digest(render_for_ingest("legacy", "tests/old.py", None))
+    legacy = {
+        "id": "a",
+        # How the old uploader named it: filename was "<name>.md", so the real
+        # extension stayed in the name.
+        "name": "tests__old.py",
+        "rawDataLocation": f"s3://b/text_{digest}.txt",
+    }
+
+    out = drift_for_items([legacy], str(tmp_path))
+
+    assert out["states"] == {"a": "current"}
+    assert out["matched"] == 1
 
 
 def test_drift_ignores_items_with_no_matching_file(tmp_path):
@@ -1242,7 +1268,10 @@ def test_ingest_sends_the_browsers_text_and_never_reads_a_path(dashboard_client,
 
     assert body["queued"] == 1
     call = fake_client.remember_background.await_args
-    assert call.kwargs["filename"] == "guides__setup.md"
+    # The real name, flattened: nothing appended, because cognee reads the
+    # extension off the bytes and never off the filename.
+    assert call.kwargs["filename"] == "guides__setup.mdx"
+    assert call.kwargs["external_metadata"]["widget_path"] == "guides/setup.mdx"
     assert b"Run it." in call.args[0]
 
 
@@ -1630,6 +1659,30 @@ def test_progress_follows_the_pipeline_it_is_asked_for(dashboard_client, fake_cl
 
 def test_ingest_progress_is_gated(dashboard_client):
     assert dashboard_client.get("/api/dashboard/ingest-progress").status_code == 401
+
+
+def test_ingest_refuses_two_files_whose_names_would_collide(dashboard_client, fake_client):
+    """cognee strips one trailing extension to make the name, so guide.md and
+    guide.py are one name. Ingesting both would leave two items indistinguishable
+    from each other and unplaceable against a source file."""
+    client = dashboard_client
+    fake_client.remember_background = AsyncMock(return_value=True)
+
+    body = client.post(
+        "/api/dashboard/ingest?token=s3cret",
+        json={
+            "files": [
+                {"path": "guides/guide.md", "text": "a"},
+                {"path": "guides/guide.py", "text": "b"},
+                {"path": "guides/other.md", "text": "c"},
+            ]
+        },
+    ).json()
+
+    assert body["queued"] == 2
+    assert len(body["skipped"]) == 1
+    assert body["skipped"][0]["path"] == "guides/guide.py"
+    assert "guides__guide" in body["skipped"][0]["why"]
 
 
 def test_ingest_refuses_a_selection_too_large_for_one_request(dashboard_client, fake_client):

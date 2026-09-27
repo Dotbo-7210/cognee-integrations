@@ -15,6 +15,7 @@ yet" state, so ``recall`` returns ``[]`` and ``forget`` is a no-op for 4xx. Only
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, Optional
@@ -241,6 +242,7 @@ class CogneeHttpClient:
         dataset_name: str,
         filename: str,
         node_set: Optional[list[str]] = None,
+        external_metadata: Optional[dict] = None,
     ) -> bool:
         """Queue one document for ingest without waiting for its graph build.
 
@@ -248,6 +250,8 @@ class CogneeHttpClient:
         would hold the request open for the whole run, so the server is asked to
         process in the background and the upload returns as soon as it is
         accepted.
+
+        ``external_metadata`` is stored on the item and comes back on a read.
 
         ``node_set`` tags the nodes this document produces. cognee takes the
         field repeated, once per tag, and ``recall``'s ``node_name`` filters on
@@ -257,6 +261,12 @@ class CogneeHttpClient:
         data: dict = {"datasetName": dataset_name, "run_in_background": "true"}
         if node_set:
             data["node_set"] = list(node_set)
+        if external_metadata:
+            # A JSON array paired positionally with the uploads, and this sends
+            # one file per call. It is where the source path goes: cognee strips
+            # a trailing extension off the filename to make the name, so the
+            # name alone cannot say which file an item came from.
+            data["external_metadata"] = json.dumps([external_metadata])
         response = await self._request(
             "POST",
             "/api/v1/remember",

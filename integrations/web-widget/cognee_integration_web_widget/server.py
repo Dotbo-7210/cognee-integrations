@@ -47,7 +47,7 @@ from pydantic import BaseModel
 
 from .adapter import ChatMemoryAdapter
 from .docs_drift import drift_for_items
-from .docs_ingest import item_name, render_for_ingest
+from .docs_ingest import item_name, render_for_ingest, upload_filename
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -864,6 +864,7 @@ async def dashboard_ingest(
         raise HTTPException(status_code=413, detail="that selection is too large for one ingest")
 
     queued, skipped, sendable = [], [], []
+    claimed: dict = {}
     for upload in body.files:
         relative = _safe_relative(upload.path)
         if relative is None:
@@ -881,6 +882,17 @@ async def dashboard_ingest(
         if not upload.text.strip():
             skipped.append({"path": relative, "why": "empty"})
             continue
+        # Two paths differing only by extension flatten to one name, because
+        # cognee strips a trailing extension to make it. Ingesting both would
+        # put two items under one name, and nothing downstream could tell them
+        # apart - so the second is refused rather than silently shadowing.
+        name = item_name(relative)
+        if name in claimed:
+            skipped.append(
+                {"path": relative, "why": f"name {name} already taken by {claimed[name]}"}
+            )
+            continue
+        claimed[name] = relative
         sendable.append((relative, upload.text))
 
     limit = asyncio.Semaphore(INGEST_CONCURRENCY)
@@ -892,8 +904,11 @@ async def dashboard_ingest(
             ok = await adapter.client.remember_background(
                 render_for_ingest(source, relative, DOCS_URL).encode("utf-8"),
                 dataset_name=dataset,
-                filename=f"{name}.md",
+                filename=upload_filename(relative),
                 node_set=[node_set],
+                # The name loses the extension, so the path it came from is
+                # recorded where it survives intact.
+                external_metadata={"widget_path": relative, "widget_root": root},
             )
         return (
             {"path": relative, "name": name, "node_set": node_set}
