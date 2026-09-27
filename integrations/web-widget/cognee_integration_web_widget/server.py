@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -315,7 +315,7 @@ async def _distil_session(conversation) -> None:
 
 
 @app.post("/api/chat/end")
-async def chat_end(req: EndSessionRequest, background: BackgroundTasks) -> JSONResponse:
+async def chat_end(request: Request, background: BackgroundTasks) -> JSONResponse:
     """The visitor closed the page: distil what the conversation taught.
 
     Sent by the widget as a beacon on pagehide, so it is fire-and-forget by
@@ -327,6 +327,18 @@ async def chat_end(req: EndSessionRequest, background: BackgroundTasks) -> JSONR
     Nothing is distilled for a visitor who opted out, for the same reason
     nothing was stored: there is no session to read.
     """
+    # The body is read by hand rather than declared as a model, because this
+    # arrives from navigator.sendBeacon and a beacon cannot survive a CORS
+    # preflight. Declaring JSON means the widget must send application/json,
+    # which is not a simple content type, so the browser sends an OPTIONS, the
+    # page finishes unloading, and the POST is never made - the preflight
+    # arrived and returned 200 eleven times while not one beacon did. Sent as
+    # text/plain there is no preflight, and the payload is still JSON.
+    try:
+        req = EndSessionRequest.model_validate_json(await request.body())
+    except Exception:  # noqa: BLE001 - a malformed beacon is not worth a 500
+        raise HTTPException(status_code=400, detail="expected a JSON body") from None
+
     if not req.opt_in:
         return JSONResponse({"distilling": False, "why": "opted out"})
     conversation = adapter.conversation(

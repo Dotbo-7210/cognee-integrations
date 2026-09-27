@@ -20,16 +20,43 @@
   var DOCS_BASE = (script && script.getAttribute("data-docs-base")) || window.location.origin;
 
   // Stable per-browser ids so a returning visitor keeps their conversation.
-  function id(key, prefix) {
-    var v = localStorage.getItem(key);
+  // Two different lifetimes, so two different stores.
+  //
+  // The visitor is the person, and localStorage is shared across their tabs and
+  // survives a close - which is what identifying someone across visits means.
+  //
+  // The conversation is this window. localStorage held it too, and localStorage
+  // is per origin: every tab on the site continued one endless conversation,
+  // and a second window joined whatever the first was saying. sessionStorage is
+  // per tab, survives a reload, and dies with the tab - the same boundary the
+  // end-of-conversation beacon uses, so a conversation and its distillation
+  // start and finish together.
+  function id(store, key, prefix) {
+    var v = null;
+    try {
+      v = store.getItem(key);
+    } catch (e) {
+      /* storage blocked: fall through to a per-page id */
+    }
     if (!v) {
       v = prefix + "-" + Math.random().toString(36).slice(2, 10);
-      localStorage.setItem(key, v);
+      try {
+        store.setItem(key, v);
+      } catch (e) {
+        /* nothing to do; the id lives as long as this page does */
+      }
     }
     return v;
   }
-  var visitorId = id("cognee_visitor_id", "visitor");
-  var conversationId = id("cognee_conversation_id", "conv");
+  var visitorId = id(localStorage, "cognee_visitor_id", "visitor");
+  var conversationId = id(sessionStorage, "cognee_conversation_id", "conv");
+  try {
+    // Left over from when this was shared across every tab. Removing it stops
+    // an old tab resurrecting the endless conversation.
+    localStorage.removeItem("cognee_conversation_id");
+  } catch (e) {
+    /* nothing to clean up */
+  }
   var optIn = localStorage.getItem("cognee_opt_in") !== "0";
 
   // The widget is embedded on sites whose themes we do not control, so every
@@ -229,20 +256,27 @@
             site_id: SITE_ID,
             opt_in: optIn,
           })],
-          { type: "application/json" }
+          // text/plain keeps this a "simple" cross-origin request. With
+          // application/json the browser preflights, and a beacon cannot
+          // outlive a preflight: the OPTIONS goes out, the page finishes
+          // unloading, and the POST never follows. The body is still JSON.
+          { type: "text/plain;charset=UTF-8" }
         )
       );
     } catch (e) {
       /* leaving anyway */
     }
   }
-  // visibilitychange is the one that fires reliably on mobile, where a tab is
-  // backgrounded rather than closed; pagehide covers the desktop close and
-  // navigation. Guarded by `unsent`, so returning to the tab and leaving again
-  // without asking anything does not distil twice.
-  document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "hidden") endConversation();
-  });
+  // pagehide only. visibilitychange fired on every tab switch, and each one
+  // distilled the whole accumulated conversation again: three of them over a
+  // ten-turn thread wrote thirty-five lessons in a minute, all restating the
+  // same few facts. Reading a docs page means switching tabs constantly, so
+  // that event is not a conversation ending - it is a visitor looking at
+  // something else.
+  //
+  // The cost is mobile, where a backgrounded tab may be discarded without ever
+  // firing pagehide, and those conversations are never distilled. Their
+  // transcripts are written per turn regardless.
   window.addEventListener("pagehide", endConversation);
 
   root.querySelector("#cognee-send").onclick = send;
