@@ -212,21 +212,47 @@ def test_chat_forget_command_is_not_answered(web_client):
     assert fake.recall.await_count == before
 
 
-def test_chat_stores_the_exchange_away_from_the_docs_corpus(web_client):
-    """The store is also the trigger: nothing in cognee bridges a session into
-    the graph on a timer, so this remember() is what makes the turn outlive the
-    cache and what sets distillation going."""
+def test_chat_writes_the_turn_into_the_conversation_transcript(web_client):
+    """One document per conversation, named by its session id. We write it
+    rather than letting the bridge persist from the cache, which dropped a turn
+    and then advanced its watermark past it."""
     client, fake_client = web_client
+    fake_client.list_datasets = AsyncMock(return_value=[])
     fake_client.remember = AsyncMock(return_value=None)
 
     client.post("/api/chat", json={"message": "what is cognee?", "conversation_id": "c1"})
 
     call = fake_client.remember.await_args
     assert call.kwargs["dataset_name"] == "web:demo:conversations"
-    assert call.kwargs["session_id"].startswith("web:demo:")
-    # Background, or the visitor waits on a cognify for a reply they have.
-    assert call.kwargs["run_in_background"] is True
-    assert "what is cognee?" in call.args[0]
+    assert call.kwargs["filename"] == "web:demo:anonymous:c1"
+    # No session id: this must not wake cognee's session bridge.
+    assert call.kwargs.get("session_id") is None
+    assert "Q: what is cognee?" in call.args[0]
+
+
+def test_chat_appends_to_an_existing_transcript_rather_than_replacing_it(web_client):
+    """The second turn patches the document, so cognee re-ingests only the
+    chunks the new turn touched and earlier ones keep their ids."""
+    client, fake_client = web_client
+    fake_client.list_datasets = AsyncMock(
+        return_value=[{"name": "web:demo:conversations", "id": "d2"}]
+    )
+    fake_client.dataset_data = AsyncMock(
+        return_value=[{"name": "web:demo:anonymous:c1", "id": "doc-1"}]
+    )
+    fake_client.fetch_raw = AsyncMock(
+        return_value=b"Conversation web:demo:anonymous:c1\n\nQ: first?\n\nA: one.\n"
+    )
+    fake_client.update_document = AsyncMock(return_value=True)
+    fake_client.remember = AsyncMock(return_value=None)
+
+    client.post("/api/chat", json={"message": "second?", "conversation_id": "c1"})
+
+    fake_client.remember.assert_not_awaited()
+    sent = fake_client.update_document.await_args.kwargs
+    assert sent["data_id"] == "doc-1"
+    assert "Q: first?" in sent["text"]  # the earlier turn survives
+    assert "Q: second?" in sent["text"]
 
 
 def test_chat_stores_nothing_when_the_visitor_opted_out(web_client):
@@ -234,6 +260,7 @@ def test_chat_stores_nothing_when_the_visitor_opted_out(web_client):
     written down. An opt-out that still filed the question would be worse than
     no opt-out, because it reads as one."""
     client, fake_client = web_client
+    fake_client.list_datasets = AsyncMock(return_value=[])
     fake_client.remember = AsyncMock(return_value=None)
 
     client.post(
@@ -248,7 +275,7 @@ def test_chat_still_answers_when_storing_the_exchange_fails(web_client):
     """The reply is already computed; losing the record of it is not a reason to
     hand the visitor an error instead."""
     client, fake_client = web_client
-    fake_client.remember = AsyncMock(side_effect=RuntimeError("cognee is down"))
+    fake_client.list_datasets = AsyncMock(side_effect=RuntimeError("cognee is down"))
 
     r = client.post("/api/chat", json={"message": "hello", "conversation_id": "c1"})
 
@@ -1812,44 +1839,38 @@ def test_deleting_one_source_also_drops_the_cached_render(dashboard_client, fake
     assert server_mod._viz_cache["html"] is None
 
 
-def test_conversations_are_rebuilt_from_what_was_stored(dashboard_client, fake_client):
-    """Grouped by the session id inside the stored text, so a turn belongs to
-    the visitor who asked it. Correlating by time was the alternative, and on
-    this tenant it gave one visitor's questions to another's conversation."""
+def test_conversations_are_read_from_their_transcripts(dashboard_client, fake_client):
+    """A conversation is one document, so its turns cannot be scattered or
+    partly missing - the two failures of the sources this replaced."""
     client = dashboard_client
     fake_client.list_datasets = AsyncMock(
         return_value=[{"name": "web:demo:conversations", "id": "d2"}]
     )
-    chunk = lambda doc, idx, txt: {  # noqa: E731 - table-style fixture
-        "type": "DocumentChunk",
-        "id": f"{doc}-{idx}",
-        "properties": {"document_id": doc, "chunk_index": idx, "text": txt},
-    }
-    fake_client.graph = AsyncMock(
-        return_value={
-            "nodes": [
-                chunk("a", 0, "Session ID: web:demo:v1:c1\n\nQuestion: install?\n\nAnswer: pip."),
-                # One document split in two: joined by id, ordered by index.
-                chunk("b", 1, " and then upgrade."),
-                chunk("b", 0, "Session ID: web:demo:v1:c1\n\nQuestion: next?\n\nAnswer: cognify"),
-                chunk(
-                    "c", 0, "Session ID: web:demo:v2:c9\n\nQuestion: node set?\n\nAnswer: A tag."
-                ),
-            ],
-            "edges": [],
-        }
+    fake_client.dataset_data = AsyncMock(
+        return_value=[
+            {"name": "web:demo:visitor-a:conv-1", "id": "doc-1"},
+            # A distilled lesson lives in this dataset too, and is not a
+            # transcript: only documents named like a session are read.
+            {"name": "text_bc8c18aeac6f2b908c0354290fca9ec5", "id": "doc-2"},
+        ]
+    )
+    fake_client.fetch_raw = AsyncMock(
+        return_value=(
+            b"Conversation web:demo:visitor-a:conv-1\n\n"
+            b"Q: install?\n\nA: pip install cognee.\n\n"
+            b"Q: and upgrade?\n\nA: pip install -U cognee.\n"
+        )
     )
 
     body = client.get("/api/dashboard/conversations?token=s3cret").json()
-    by_session = {c["session_id"]: c for c in body["conversations"]}
 
-    assert set(by_session) == {"web:demo:v1:c1", "web:demo:v2:c9"}
-    assert len(by_session["web:demo:v1:c1"]["turns"]) == 2
-    assert by_session["web:demo:v1:c1"]["visitor"] == "v1"
-    # The split document reassembled in index order, not chunk order.
-    assert "cognify and then upgrade." in str(
-        [t["answer"] for t in by_session["web:demo:v1:c1"]["turns"]]
-    )
+    assert len(body["conversations"]) == 1
+    conversation = body["conversations"][0]
+    assert conversation["visitor"] == "visitor-a"
+    assert [t["question"] for t in conversation["turns"]] == ["install?", "and upgrade?"]
+    assert conversation["turns"][1]["answer"] == "pip install -U cognee."
+    # One read per transcript, and none for the lesson.
+    assert fake_client.fetch_raw.await_count == 1
 
 
 def test_conversations_are_empty_before_anything_is_stored(dashboard_client, fake_client):

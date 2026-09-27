@@ -70,6 +70,7 @@ class CogneeHttpClient:
         dataset_name: str,
         session_id: Optional[str] = None,
         run_in_background: bool = False,
+        filename: str = "message.txt",
     ) -> None:
         """Durably store ``text`` in ``dataset_name`` (cognee add + cognify).
 
@@ -90,7 +91,7 @@ class CogneeHttpClient:
             "POST",
             "/api/v1/remember",
             data=data,
-            files={"data": ("message.txt", text.encode("utf-8"), "text/plain")},
+            files={"data": (filename, text.encode("utf-8"), "text/plain")},
         )
         response.raise_for_status()
 
@@ -321,6 +322,30 @@ class CogneeHttpClient:
         except ValueError:
             detail = response.text[:300]
         return False, detail or f"cognee answered {response.status_code}"
+
+    async def update_document(
+        self, *, data_id: str, dataset_id: str, text: str, filename: str
+    ) -> bool:
+        """Replace a stored document with a new version of itself.
+
+        ``chunk_level_diff`` is what makes this worth doing over delete-and-add:
+        cognee diffs the new text against the stored one and re-ingests only the
+        chunks the edit touched, so appending a turn to a transcript leaves
+        every earlier chunk - and the ids, entities and summaries hanging off it
+        - exactly where it was.
+        """
+        response = await self._request(
+            "PATCH",
+            "/api/v1/update",
+            params={
+                "data_id": data_id,
+                "dataset_id": dataset_id,
+                "chunk_level_diff": "true",
+            },
+            files={"data": (filename, text.encode("utf-8"), "text/plain")},
+            timeout_override=120.0,
+        )
+        return response.status_code < 400
 
     async def dataset_progress(self, dataset_id: str, pipeline: str = "cognify_pipeline") -> dict:
         """How far cognee has got building the graph for ``dataset_id``.

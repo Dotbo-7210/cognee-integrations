@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -133,37 +133,112 @@ class ForgetRequest(BaseModel):
     site_id: str = DEMO_SITE_ID
 
 
-async def _store_exchange(conversation, question: str, answer: str) -> None:
-    """Keep this exchange, in the conversations corpus.
+# One document per conversation, named by its session id, holding the whole
+# transcript. Turns are appended to it.
+TRANSCRIPT_HEADER = "Conversation {session}\n"
+_TURN = "\nQ: {question}\n\nA: {answer}\n"
 
-    Two jobs in one call. It stores the turn where it outlives the session
-    cache - which holds turns for seven days of inactivity and is dropped
-    outright when its dataset is deleted - and it is the trigger for cognee's
-    session bridge, which persists the session's Q&A into that dataset's graph
-    and distils lessons from it. Nothing in cognee does that on a timer; the
-    bridge only runs because a remember() with a session id asked it to.
 
-    Not the docs corpus, so none of it can answer a visitor. In the background,
-    so the visitor does not wait on a cognify for a reply they already have. And
-    never fatal: they have the reply, and losing the record of it is not a
-    reason to hand them an error instead.
+def transcript_with(previous: str, session: str, question: str, answer: str) -> str:
+    """The transcript after this turn.
 
-    Only when the visitor opted in - the same consent that governs whether the
-    turn is remembered at all.
+    Append-only, and the whole file is rewritten each time rather than a
+    fragment being sent: cognee diffs it against the stored copy and re-ingests
+    only the chunks the new turn touched, so rewriting costs about what
+    appending would and needs no separate notion of where the file ended.
     """
+    body = previous if previous.strip() else TRANSCRIPT_HEADER.format(session=session)
+    return body.rstrip("\n") + "\n" + _TURN.format(question=question.strip(), answer=answer.strip())
+
+
+def turns_from_transcript(text: str) -> list:
+    """The turns in a transcript, in the order they were asked."""
+    turns = []
+    for block in text.split("\nQ: ")[1:]:
+        question, _, answer = block.partition("\n\nA: ")
+        turns.append({"question": question.strip()[:2000], "answer": answer.strip()[:4000]})
+    return turns
+
+
+# One lock per conversation. Appending is read-modify-write against a document
+# in cognee, and two turns answered close together both read the transcript
+# before either had written: the second write landed on a copy that never had
+# the first turn in it, and one turn vanished. Holding a lock across the whole
+# read-and-write makes the sequence atomic.
+#
+# Per process, which is what this backend is. Two of them writing the same
+# conversation would race again, and the fix then is a conditional write cognee
+# does not currently offer - worth knowing before this is scaled out.
+_transcript_locks: dict = {}
+
+
+def _transcript_lock(session_id: str) -> asyncio.Lock:
+    lock = _transcript_locks.get(session_id)
+    if lock is None:
+        lock = _transcript_locks.setdefault(session_id, asyncio.Lock())
+    return lock
+
+
+async def _append_to_transcript(conversation, question: str, answer: str) -> None:
+    """Add this turn to the conversation's own transcript.
+
+    We write it rather than letting cognee's session bridge do it. The bridge
+    persisted turns from the session cache, and on this tenant it skipped one of
+    a three-turn conversation and then advanced its watermark past it, so the
+    turn could never be recovered - and it only ran at all because every answer
+    paid for a full improve. A file we own has neither problem: what is in it is
+    what was said.
+
+    Nothing here triggers distillation any more. Lessons come from
+    improve(session_ids=...), which reads the session cache and can be called
+    whenever, rather than from a remember() on every answer.
+    """
+    dataset = adapter.conversations_dataset(conversation.site_id)
+    name = conversation.session_id
     try:
-        await adapter.client.remember(
-            f"Q: {question}\n\nA: {answer}",
-            dataset_name=adapter.conversations_dataset(conversation.site_id),
-            session_id=conversation.session_id,
-            run_in_background=True,
-        )
+        async with _transcript_lock(name):
+            await _write_turn(dataset, name, question, answer)
     except Exception as error:  # noqa: BLE001 - the answer is already out
-        print(f"[web_widget] storing the exchange failed: {error}")
+        print(f"[web_widget] appending to the transcript failed: {error}")
+
+
+async def _write_turn(dataset: str, name: str, question: str, answer: str) -> None:
+    """Read the transcript, add this turn, put it back. Caller holds the lock."""
+    datasets = await adapter.client.list_datasets()
+    match = next((d for d in datasets if isinstance(d, dict) and d.get("name") == dataset), None)
+    existing = None
+    if match:
+        for item in await adapter.client.dataset_data(str(match.get("id"))):
+            if str(_field(item, "name")) == name:
+                existing = item
+                break
+
+    previous = ""
+    if existing:
+        raw = await adapter.client.fetch_raw(
+            dataset_id=str(match.get("id")), data_id=str(_field(existing, "id"))
+        )
+        previous = raw.decode("utf-8", "replace") if raw else ""
+
+    text = transcript_with(previous, name, question, answer)
+    if existing:
+        ok = await adapter.client.update_document(
+            data_id=str(_field(existing, "id")),
+            dataset_id=str(match.get("id")),
+            text=text,
+            filename=name,
+        )
+        # Checked rather than discarded: a refused patch is the one way a turn
+        # goes missing with nothing else noticing.
+        if not ok:
+            print(f"[web_widget] cognee refused the transcript update for {name}")
+    else:
+        # No session id: this must not wake the bridge.
+        await adapter.client.remember(text, dataset_name=dataset, filename=name)
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest) -> JSONResponse:
+async def chat(req: ChatRequest, background: BackgroundTasks) -> JSONResponse:
     conversation = adapter.conversation(
         site_id=req.site_id, visitor_id=req.visitor_id, conversation_id=req.conversation_id
     )
@@ -189,7 +264,11 @@ async def chat(req: ChatRequest) -> JSONResponse:
         remember=req.opt_in,
     )
     if req.opt_in:
-        await _store_exchange(conversation, req.message, answer.text)
+        # After the response, not before it: reading the transcript, rewriting
+        # it and re-chunking are several round trips and the visitor has their
+        # reply already. A BackgroundTask rather than a loose create_task, so
+        # the work is owned by the request and cannot be dropped on shutdown.
+        background.add_task(_append_to_transcript, conversation, req.message, answer.text)
     return JSONResponse(answer.as_dict())
 
 
@@ -1038,82 +1117,20 @@ def _conversation_memory(graph: dict) -> dict:
     }
 
 
-# cognee's own format for a persisted turn, written by the session bridge:
-#   Session ID: web:demo:visitor:conv
-#
-#   Question: ...
-#
-#   Answer: ...
-_PERSISTED_TURN = re.compile(
-    r"Session ID:\s*(?P<session>\S+)\s*"
-    r"Question:\s*(?P<question>.*?)\s*"
-    r"Answer:\s*(?P<answer>.*)\s*\Z",
-    re.S,
-)
-
-
-def _documents_from_graph(graph: dict) -> list:
-    """Rebuild each stored document from its chunks, in order.
-
-    A document is split across DocumentChunks, each carrying document_id and
-    chunk_index, so joining by the first and sorting by the second reassembles
-    the text exactly - and costs one graph read rather than a round trip per
-    document, which is what listing them item by item would have cost.
-    """
-    by_document: dict = {}
-    for node in graph.get("nodes") or []:
-        if not isinstance(node, dict) or str(node.get("type")) != "DocumentChunk":
-            continue
-        props = node.get("properties") or {}
-        key = str(props.get("document_id") or node.get("id"))
-        by_document.setdefault(key, []).append(
-            (int(props.get("chunk_index") or 0), str(props.get("text") or ""))
-        )
-    return ["".join(text for _, text in sorted(parts)) for parts in by_document.values()]
-
-
-def _conversations_from_documents(documents: list) -> list:
-    """Group persisted turns into conversations, newest first.
-
-    The session id travels inside the stored text, which is what makes this
-    exact: turns are grouped by who asked them, not by when they happened near
-    each other. Correlating by time was the alternative, and on this tenant it
-    attributed one visitor's questions to another's conversation.
-    """
-    conversations: dict = {}
-    for document in documents:
-        match = _PERSISTED_TURN.search(document)
-        if not match:
-            continue
-        session = match.group("session").strip()
-        turn = {
-            "question": match.group("question").strip()[:2000],
-            "answer": match.group("answer").strip()[:4000],
-        }
-        conversations.setdefault(session, []).append(turn)
-    return [
-        {
-            "session_id": session,
-            # web:demo:visitor-x:conv-y -> the identifying half
-            "visitor": session.split(":")[2] if len(session.split(":")) > 2 else session,
-            "turns": turns,
-        }
-        for session, turns in conversations.items()
-    ]
-
-
 @app.get("/api/dashboard/conversations")
 async def dashboard_conversations(token: Optional[str] = Query(default=None)) -> JSONResponse:
-    """Conversations rebuilt from what was actually stored.
+    """Conversations, read from the transcript written for each one.
 
-    Not from the session cache, which is where this list used to come from. That
-    cache holds an index whose entries outlive their own contents: a dataset
-    delete drops every turn it holds while leaving the session rows and their
-    token totals behind, so conversations with real traffic showed as empty and
-    there was no way to tell them from ones that never had a turn.
+    One document per conversation, named by its session id, so a conversation
+    is a document rather than something reassembled from scattered parts. Two
+    earlier sources failed at exactly that: the session cache kept an index
+    whose entries outlived their contents, and the bridge's per-turn documents
+    silently lost a turn to a watermark.
 
-    This shows a conversation when the turns exist to show. Nothing appears
-    until the bridge has persisted it, and what appears can be read.
+    The bodies are read one per conversation. That is a round trip each, which
+    is why it reads the listing first and fetches only documents named like a
+    session - the dataset also holds distilled lessons, and they are not
+    transcripts.
     """
     _require_dashboard(token)
     dataset = adapter.conversations_dataset(DEMO_SITE_ID)
@@ -1121,9 +1138,28 @@ async def dashboard_conversations(token: Optional[str] = Query(default=None)) ->
     match = next((d for d in datasets if isinstance(d, dict) and d.get("name") == dataset), None)
     if not match:
         return JSONResponse({"dataset": dataset, "exists": False, "conversations": []})
-    graph = await adapter.client.graph(str(match.get("id")))
-    conversations = _conversations_from_documents(_documents_from_graph(graph))
-    return JSONResponse({"dataset": dataset, "exists": True, "conversations": conversations})
+
+    dataset_id = str(match.get("id"))
+    items = await adapter.client.dataset_data(dataset_id)
+    wanted = [i for i in items if str(_field(i, "name")).startswith(f"web:{DEMO_SITE_ID}:")][:100]
+
+    limit = asyncio.Semaphore(4)
+
+    async def read(item) -> dict:
+        async with limit:
+            raw = await adapter.client.fetch_raw(
+                dataset_id=dataset_id, data_id=str(_field(item, "id"))
+            )
+        name = str(_field(item, "name"))
+        parts = name.split(":")
+        return {
+            "session_id": name,
+            "visitor": parts[2] if len(parts) > 2 else name,
+            "turns": turns_from_transcript(raw.decode("utf-8", "replace") if raw else ""),
+        }
+
+    conversations = await asyncio.gather(*(read(i) for i in wanted))
+    return JSONResponse({"dataset": dataset, "exists": True, "conversations": list(conversations)})
 
 
 @app.get("/api/dashboard/conversation-memory")
