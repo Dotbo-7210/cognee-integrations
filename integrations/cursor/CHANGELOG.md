@@ -38,6 +38,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
   opts out). `session-context-lookup.py` writes the per-conversation recall marker
   (`recall/<conversation id>.json`) the bar reads, so several terminals each show
   their own counts. The plain-text `render_status_for_host` header stays for the IDE.
+- `~/.cognee-plugin/cursor/adapter.log`: one JSON line per hook launch (Cursor event,
+  inner script, conversation/turn, outcome, duration), written by the adapter itself so
+  skipped and failed launches are visible too.
 - Root `.cursor-plugin/marketplace.json` listing this plugin, so the repository can
   be imported as a Cursor (team) marketplace or submitted to the Cursor Marketplace,
   like `.claude-plugin/marketplace.json` for Claude Code; its version is checked by

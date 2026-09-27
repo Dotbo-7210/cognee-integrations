@@ -37,6 +37,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, BinaryIO, Callable
 
@@ -127,6 +128,35 @@ def state_dir() -> Path:
 def neutral_reply(event: str) -> dict[str, Any]:
     """The reply that changes nothing for ``event``."""
     return {"continue": True} if event == "UserPromptSubmit" else {}
+
+
+ADAPTER_LOG_NAME = "adapter.log"
+_ADAPTER_LOG_MAX_BYTES = 2 * 1024 * 1024
+
+
+def adapter_log(detail: dict[str, Any], root: Path | None = None) -> None:
+    """Append one JSON line to ``~/.cognee-plugin/cursor/adapter.log``; never raises.
+
+    Cursor shows hook launches only in the IDE's *Hooks* output channel, and the
+    inner scripts log nothing when they are skipped, so this is the one record
+    of *which Cursor hooks actually fired* with what session/turn — the first
+    thing to check when a stage seems missing. Kept separate from ``hook.log``
+    (whose writers hold a lock) and bounded by truncation.
+    """
+    try:
+        base = root or state_dir()
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / ADAPTER_LOG_NAME
+        try:
+            if path.stat().st_size > _ADAPTER_LOG_MAX_BYTES:
+                path.write_text("", encoding="utf-8")
+        except OSError:
+            pass
+        record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "pid": os.getpid(), **detail}
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -603,24 +633,40 @@ def main(argv: list[str] | None = None) -> int:
 
     event = EVENT_FOR_SCRIPT.get(script, "")
     reply = neutral_reply(event)
+    started = time.monotonic()
+    record: dict[str, Any] = {"event": "adapter.invoked", "script": script, "flags": list(flags)}
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
         if not isinstance(payload, dict):
             payload = {}
+        record["cursor_event"] = str(payload.get("hook_event_name") or "")
+        record["session"] = str(payload.get("conversation_id") or payload.get("session_id") or "")
+        record["turn"] = str(payload.get("generation_id") or "")
         normalized = normalize_payload(payload, script, flags)
         event = normalized["hook_event_name"]
+        record["inner_event"] = event
+        if normalized.get("tool_name"):
+            record["tool"] = normalized["tool_name"]
         reply = neutral_reply(event)
-        if not should_skip(normalized, script, flags):
+        if should_skip(normalized, script, flags):
+            record["outcome"] = "skipped"
+        else:
             output = run_inner_hook(normalized, script, flags)
             reply = translate_output(event, output)
+            record["outcome"] = "ran"
+            record["reply_keys"] = sorted(reply)
     except Exception as exc:  # fail open, always
+        record["outcome"] = "failed"
+        record["error"] = f"{type(exc).__name__}: {exc}"[:200]
         try:
             sys.stderr.write(f"cognee-cursor: {script} failed: {type(exc).__name__}: {exc}\n")
         except Exception:
             pass
         reply = neutral_reply(event)
 
+    record["ms"] = round((time.monotonic() - started) * 1000)
+    adapter_log(record)
     print(json.dumps(reply))
     return 0
 

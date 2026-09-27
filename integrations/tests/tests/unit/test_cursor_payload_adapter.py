@@ -510,6 +510,31 @@ def test_main_runs_the_inner_hook_and_translates_its_reply(adapter, monkeypatch,
     assert json.loads(capsys.readouterr().out.strip()) == {"additional_context": "traced"}
 
 
+def test_main_records_every_invocation_in_the_adapter_log(adapter, monkeypatch, capsys):
+    """adapter.log is the only record of which Cursor hooks fired; one line per
+    launch with outcome ran / skipped / failed."""
+    monkeypatch.setattr(
+        adapter, "_run_script", lambda payload, script, flags: json.dumps({"ok": True})
+    )
+    monkeypatch.setattr("sys.stdin", _Stdin(json.dumps(_payload("stop", status="completed"))))
+    assert adapter.main(["store-to-session.py", "--stop"]) == 0  # no answer -> skipped
+    monkeypatch.setattr("sys.stdin", _Stdin(json.dumps(_payload("stop", status="completed"))))
+    assert adapter.main(["credits-refresh.py"]) == 0  # ran
+    monkeypatch.setattr("sys.stdin", _Stdin("{not json"))
+    assert adapter.main(["session-context-lookup.py"]) == 0  # failed open
+    capsys.readouterr()
+
+    log = adapter.state_dir() / adapter.ADAPTER_LOG_NAME
+    records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert [r["outcome"] for r in records] == ["skipped", "ran", "failed"]
+    assert records[0]["cursor_event"] == "stop" and records[0]["inner_event"] == "Stop"
+    assert records[0]["session"] == "conv-123" and records[0]["turn"] == "gen-7"
+    assert records[0]["flags"] == ["--stop"]
+    assert records[1]["script"] == "credits-refresh.py" and records[1]["reply_keys"] == []
+    assert "JSONDecodeError" in records[2]["error"]
+    assert all(isinstance(r["ms"], int) and "ts" in r and "pid" in r for r in records)
+
+
 def test_hook_table_only_names_known_scripts_with_bounded_timeouts(adapter):
     for event, entries in adapter.HOOK_TABLE.items():
         assert event in adapter.EVENT_MAP, event
