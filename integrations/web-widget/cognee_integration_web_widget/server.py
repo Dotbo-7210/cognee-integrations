@@ -359,57 +359,6 @@ async def dashboard_data(token: Optional[str] = Query(default=None)) -> JSONResp
     return JSONResponse(await _dashboard_data())
 
 
-@app.get("/api/dashboard/sessions")
-async def dashboard_sessions(token: Optional[str] = Query(default=None)) -> JSONResponse:
-    """Widget conversations, newest activity first.
-
-    Sessions are filtered to this site's prefix: the key can see every session
-    in the tenant, and an operator looking at the widget's dashboard wants the
-    widget's conversations, not an agent's.
-    """
-    _require_dashboard(token)
-    prefix = f"web:{DEMO_SITE_ID}:"
-    sessions = [
-        {
-            "session_id": str(_field(x, "session_id")),
-            "started_at": str(_field(x, "started_at")),
-            "last_activity_at": str(_field(x, "last_activity_at", "ended_at")),
-            # msg_count is not populated on the list endpoint; the per-session
-            # detail carries it, so it is fetched on expand rather than shown here.
-            "tokens_in": _field(x, "tokens_in", default=None),
-            "tokens_out": _field(x, "tokens_out", default=None),
-            "cost_usd": _field(x, "cost_usd", default=None),
-        }
-        for x in await adapter.client.list_sessions()
-        if str(_field(x, "session_id")).startswith(prefix)
-    ]
-    sessions.sort(key=lambda x: x["last_activity_at"] or x["started_at"], reverse=True)
-    return JSONResponse({"sessions": sessions})
-
-
-@app.get("/api/dashboard/sessions/{session_id:path}")
-async def dashboard_session(
-    session_id: str, token: Optional[str] = Query(default=None)
-) -> JSONResponse:
-    """One conversation: every question with the answer it got."""
-    _require_dashboard(token)
-    if not session_id.startswith(f"web:{DEMO_SITE_ID}:"):
-        raise HTTPException(status_code=404)
-    detail = await adapter.client.session_detail(session_id)
-    turns = [
-        {
-            "question": str(_field(q, "question")),
-            "answer": str(_field(q, "answer")),
-            "time": str(_field(q, "time")),
-            "feedback_score": _field(q, "feedback_score", default=None),
-            "feedback_text": str(_field(q, "feedback_text")),
-        }
-        for q in (detail.get("qas") or [])
-    ]
-    turns.sort(key=lambda t: t["time"])
-    return JSONResponse({"session_id": session_id, "turns": turns})
-
-
 async def _empty_list() -> list:
     """An already-satisfied empty result, so the gather above stays symmetrical."""
     return []
@@ -1062,6 +1011,94 @@ def _conversation_memory(graph: dict) -> dict:
         },
         "unclassified": [{"type": k, "count": v} for k, v in other.most_common(10)],
     }
+
+
+# cognee's own format for a persisted turn, written by the session bridge:
+#   Session ID: web:demo:visitor:conv
+#
+#   Question: ...
+#
+#   Answer: ...
+_PERSISTED_TURN = re.compile(
+    r"Session ID:\s*(?P<session>\S+)\s*"
+    r"Question:\s*(?P<question>.*?)\s*"
+    r"Answer:\s*(?P<answer>.*)\s*\Z",
+    re.S,
+)
+
+
+def _documents_from_graph(graph: dict) -> list:
+    """Rebuild each stored document from its chunks, in order.
+
+    A document is split across DocumentChunks, each carrying document_id and
+    chunk_index, so joining by the first and sorting by the second reassembles
+    the text exactly - and costs one graph read rather than a round trip per
+    document, which is what listing them item by item would have cost.
+    """
+    by_document: dict = {}
+    for node in graph.get("nodes") or []:
+        if not isinstance(node, dict) or str(node.get("type")) != "DocumentChunk":
+            continue
+        props = node.get("properties") or {}
+        key = str(props.get("document_id") or node.get("id"))
+        by_document.setdefault(key, []).append(
+            (int(props.get("chunk_index") or 0), str(props.get("text") or ""))
+        )
+    return ["".join(text for _, text in sorted(parts)) for parts in by_document.values()]
+
+
+def _conversations_from_documents(documents: list) -> list:
+    """Group persisted turns into conversations, newest first.
+
+    The session id travels inside the stored text, which is what makes this
+    exact: turns are grouped by who asked them, not by when they happened near
+    each other. Correlating by time was the alternative, and on this tenant it
+    attributed one visitor's questions to another's conversation.
+    """
+    conversations: dict = {}
+    for document in documents:
+        match = _PERSISTED_TURN.search(document)
+        if not match:
+            continue
+        session = match.group("session").strip()
+        turn = {
+            "question": match.group("question").strip()[:2000],
+            "answer": match.group("answer").strip()[:4000],
+        }
+        conversations.setdefault(session, []).append(turn)
+    return [
+        {
+            "session_id": session,
+            # web:demo:visitor-x:conv-y -> the identifying half
+            "visitor": session.split(":")[2] if len(session.split(":")) > 2 else session,
+            "turns": turns,
+        }
+        for session, turns in conversations.items()
+    ]
+
+
+@app.get("/api/dashboard/conversations")
+async def dashboard_conversations(token: Optional[str] = Query(default=None)) -> JSONResponse:
+    """Conversations rebuilt from what was actually stored.
+
+    Not from the session cache, which is where this list used to come from. That
+    cache holds an index whose entries outlive their own contents: a dataset
+    delete drops every turn it holds while leaving the session rows and their
+    token totals behind, so conversations with real traffic showed as empty and
+    there was no way to tell them from ones that never had a turn.
+
+    This shows a conversation when the turns exist to show. Nothing appears
+    until the bridge has persisted it, and what appears can be read.
+    """
+    _require_dashboard(token)
+    dataset = adapter.conversations_dataset(DEMO_SITE_ID)
+    datasets = await adapter.client.list_datasets()
+    match = next((d for d in datasets if isinstance(d, dict) and d.get("name") == dataset), None)
+    if not match:
+        return JSONResponse({"dataset": dataset, "exists": False, "conversations": []})
+    graph = await adapter.client.graph(str(match.get("id")))
+    conversations = _conversations_from_documents(_documents_from_graph(graph))
+    return JSONResponse({"dataset": dataset, "exists": True, "conversations": conversations})
 
 
 @app.get("/api/dashboard/conversation-memory")

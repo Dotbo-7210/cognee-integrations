@@ -408,9 +408,8 @@
   <div class="panel">
     <table id="sessions">
       <thead><tr>
-        <th data-sort="last_activity_at">last active</th>
-        <th data-sort="session_id">visitor / conversation</th>
-        <th data-sort="tokens_in">tokens (session)</th>
+        <th data-sort="visitor">visitor / conversation</th>
+        <th data-sort="turns">turns</th>
         <th></th>
       </tr></thead>
       <tbody></tbody>
@@ -1296,75 +1295,67 @@
       });
   }
 
+  // Conversations come from what was stored, not from the session cache. That
+  // cache is an index whose entries outlive their contents: a dataset delete
+  // drops every turn while leaving the session rows and their token totals, so
+  // conversations that carried real traffic showed as empty rows and could not
+  // be told apart from ones that never had a turn. A conversation appears here
+  // when there is something to read.
   function renderSessions(list) {
     const body = $("#sessions tbody");
     body.textContent = "";
+    if (!list.length) {
+      const tr = body.insertRow();
+      const td = tr.insertCell();
+      td.colSpan = 3;
+      td.className = "empty";
+      td.appendChild(text(
+        "No conversations stored yet. A conversation is written to " +
+        "web:demo:conversations once a visitor who opted in has asked something, " +
+        "and appears here when it has."));
+      return;
+    }
     list.forEach((s) => {
       const tr = body.insertRow();
-      cell(tr, ago(s.last_activity_at || s.started_at),
-           s.last_activity_at || s.started_at).className = "when";
-      // web:demo:visitor-x:conv-y -> the identifying half
-      cell(tr, s.session_id.replace(/^web:[^:]*:/, ""), s.session_id);
-      // msg_count is null on the list endpoint (only the detail carries it),
-      // so show tokens, which are populated, and let turns appear on expand.
-      cell(tr, (s.tokens_in || 0).toLocaleString() + " in / " +
-               (s.tokens_out || 0).toLocaleString() + " out",
-           "Totalled across every turn in this conversation, not the visible one")
-        .className = "num";
+      cell(tr, s.visitor, s.session_id);
+      cell(tr, s.turns.length + (s.turns.length === 1 ? " turn" : " turns")).className = "num";
       const actions = tr.insertCell();
       actions.className = "act";
       const btn = document.createElement("button");
       btn.appendChild(text("View"));
       let open = null;
-      btn.onclick = async () => {
+      // No fetch: the turns came with the list, because rebuilding them is one
+      // read of a small graph rather than a round trip per conversation.
+      btn.onclick = () => {
         if (open) { open.remove(); open = null; btn.textContent = "View"; return; }
-        btn.disabled = true;
-        try {
-          const r = await fetch(api("/api/dashboard/sessions/" + s.session_id));
-          const d = await r.json();
-          open = body.insertRow(tr.rowIndex);
-          const td = open.insertCell();
-          td.colSpan = 4;
-          td.className = "transcript";
-          if (!d.turns.length) {
-            td.appendChild(text("No recorded turns for this conversation."));
-            td.className = "empty";
-          }
-          d.turns.forEach((t) => {
-            const wrap = document.createElement("div");
-            wrap.className = "turn";
-            const qRole = document.createElement("div");
-            qRole.className = "role";
-            qRole.appendChild(text("visitor"));
-            const q = document.createElement("div");
-            q.className = "q";
-            q.appendChild(text(t.question));
-            const aRole = document.createElement("div");
-            aRole.className = "role";
-            aRole.appendChild(text("widget"));
-            const a = document.createElement("div");
-            a.className = "a";
-            a.appendChild(text(t.answer));
-            const when = document.createElement("div");
-            when.className = "turn-meta";
-            when.appendChild(text(ago(t.time) + (t.feedback_score != null
-              ? " · feedback " + t.feedback_score : "")));
-            wrap.append(qRole, q, aRole, a, when);
-            td.appendChild(wrap);
-          });
-          btn.textContent = "Hide";
-        } catch (e) {
-          toast("Could not load conversation: " + e.message, true);
-        } finally {
-          btn.disabled = false;
-        }
+        open = body.insertRow(tr.rowIndex);
+        const td = open.insertCell();
+        td.colSpan = 3;
+        td.className = "transcript";
+        s.turns.forEach((t) => {
+          const wrap = document.createElement("div");
+          wrap.className = "turn";
+          const qRole = document.createElement("div");
+          qRole.className = "role";
+          qRole.appendChild(text("visitor"));
+          const q = document.createElement("div");
+          q.className = "q";
+          q.appendChild(text(t.question));
+          const aRole = document.createElement("div");
+          aRole.className = "role";
+          aRole.appendChild(text("widget"));
+          const a = document.createElement("div");
+          a.className = "a";
+          a.appendChild(text(t.answer));
+          wrap.append(qRole, q, aRole, a);
+          td.appendChild(wrap);
+        });
+        btn.textContent = "Hide";
       };
       actions.appendChild(btn);
     });
   }
 
-  // Horizontal bars: the categories are named, the values are magnitudes, and
-  // the labels are long - so bars run along the length the eye compares best.
   function barChart(parent, heading, note, rows, total) {
     const max = Math.max(...rows.map((r) => r.count), 1);
     const box = document.createElement("div");
@@ -2038,7 +2029,7 @@
     // they go out together; waiting for the first doubled time-to-paint.
     const [d, s] = await Promise.all([
       fetch(api("/api/dashboard")).then((r) => r.json()),
-      fetch(api("/api/dashboard/sessions")).then((r) => r.json()),
+      fetch(api("/api/dashboard/conversations")).then((r) => r.json()),
     ]);
     corpus = d.corpus;
 
@@ -2128,8 +2119,9 @@
       act.append(b, vizStatus);
     });
 
-    sessions = s.sessions;
-    $("#sess-count").textContent = sessions.length + " conversations";
+    sessions = s.conversations || [];
+    $("#sess-count").textContent = sessions.length +
+      (sessions.length === 1 ? " conversation" : " conversations") + " stored";
     renderSessions(sessions);
 
     // Analytics last, and never awaited. It is the most expensive thing on the

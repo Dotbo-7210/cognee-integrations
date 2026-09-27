@@ -615,24 +615,6 @@ def interactive_client(dashboard_client, fake_client):
     return dashboard_client, fake_client
 
 
-def test_sessions_are_filtered_to_this_widget(interactive_client):
-    """The key sees the whole tenant's sessions; the widget dashboard must not."""
-    client, _ = interactive_client
-    body = client.get("/api/dashboard/sessions?token=s3cret").json()
-    ids = [s["session_id"] for s in body["sessions"]]
-    assert ids == ["web:demo:visitor-b:conv-2", "web:demo:visitor-a:conv-1"]  # newest first
-    assert not any("default_session" in i for i in ids)
-
-
-def test_session_detail_returns_both_sides_in_order(interactive_client):
-    client, _ = interactive_client
-    body = client.get("/api/dashboard/sessions/web:demo:visitor-a:conv-1?token=s3cret").json()
-    assert [(t["question"], t["answer"]) for t in body["turns"]] == [
-        ("first?", "A"),
-        ("second?", "B"),
-    ]
-
-
 def test_session_detail_refuses_a_session_from_another_site(interactive_client):
     """Path traversal into another agent's conversation must not be possible."""
     client, _ = interactive_client
@@ -655,8 +637,8 @@ def test_delete_surfaces_a_refusal_rather_than_reporting_success(interactive_cli
 @pytest.mark.parametrize(
     "path",
     [
-        "/api/dashboard/sessions",
-        "/api/dashboard/sessions/web:demo:visitor-a:conv-1",
+        "/api/dashboard/conversations",
+        "/api/dashboard/conversation-memory",
     ],
 )
 def test_new_routes_are_gated_too(interactive_client, path):
@@ -1828,6 +1810,64 @@ def test_deleting_one_source_also_drops_the_cached_render(dashboard_client, fake
     client.delete("/api/dashboard/data/abc?token=s3cret")
 
     assert server_mod._viz_cache["html"] is None
+
+
+def test_conversations_are_rebuilt_from_what_was_stored(dashboard_client, fake_client):
+    """Grouped by the session id inside the stored text, so a turn belongs to
+    the visitor who asked it. Correlating by time was the alternative, and on
+    this tenant it gave one visitor's questions to another's conversation."""
+    client = dashboard_client
+    fake_client.list_datasets = AsyncMock(
+        return_value=[{"name": "web:demo:conversations", "id": "d2"}]
+    )
+    chunk = lambda doc, idx, txt: {  # noqa: E731 - table-style fixture
+        "type": "DocumentChunk",
+        "id": f"{doc}-{idx}",
+        "properties": {"document_id": doc, "chunk_index": idx, "text": txt},
+    }
+    fake_client.graph = AsyncMock(
+        return_value={
+            "nodes": [
+                chunk("a", 0, "Session ID: web:demo:v1:c1\n\nQuestion: install?\n\nAnswer: pip."),
+                # One document split in two: joined by id, ordered by index.
+                chunk("b", 1, " and then upgrade."),
+                chunk("b", 0, "Session ID: web:demo:v1:c1\n\nQuestion: next?\n\nAnswer: cognify"),
+                chunk(
+                    "c", 0, "Session ID: web:demo:v2:c9\n\nQuestion: node set?\n\nAnswer: A tag."
+                ),
+            ],
+            "edges": [],
+        }
+    )
+
+    body = client.get("/api/dashboard/conversations?token=s3cret").json()
+    by_session = {c["session_id"]: c for c in body["conversations"]}
+
+    assert set(by_session) == {"web:demo:v1:c1", "web:demo:v2:c9"}
+    assert len(by_session["web:demo:v1:c1"]["turns"]) == 2
+    assert by_session["web:demo:v1:c1"]["visitor"] == "v1"
+    # The split document reassembled in index order, not chunk order.
+    assert "cognify and then upgrade." in str(
+        [t["answer"] for t in by_session["web:demo:v1:c1"]["turns"]]
+    )
+
+
+def test_conversations_are_empty_before_anything_is_stored(dashboard_client, fake_client):
+    """The dataset is created by the first stored exchange, so its absence is an
+    empty list rather than an error - and no longer a wall of empty rows from a
+    cache whose contents were deleted."""
+    client = dashboard_client
+    fake_client.list_datasets = AsyncMock(return_value=[{"name": "web:demo:docs", "id": "d1"}])
+    fake_client.graph = AsyncMock(return_value={"nodes": [], "edges": []})
+
+    body = client.get("/api/dashboard/conversations?token=s3cret").json()
+
+    assert body == {
+        "dataset": "web:demo:conversations",
+        "exists": False,
+        "conversations": [],
+    }
+    fake_client.graph.assert_not_awaited()
 
 
 def test_conversation_memory_separates_lessons_from_turns(dashboard_client, fake_client):
