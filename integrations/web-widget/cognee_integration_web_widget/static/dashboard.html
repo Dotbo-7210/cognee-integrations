@@ -1852,10 +1852,12 @@
     memoryCount = d.item_count || 0;
     const stats = document.createElement("div");
     stats.className = "stats";
-    stat(stats, String(d.counts.sessions), "conversations");
-    stat(stats, String(d.counts.turns), "turns");
+    stat(stats, String(d.counts.sessions), "transcripts",
+         "One per conversation, written as each answer goes out. " +
+         "Their turns are listed under Conversations.");
     // The reason the dataset exists: what the conversations taught.
-    stat(stats, String(d.counts.lessons), "lessons distilled");
+    stat(stats, String(d.counts.lessons), "lessons distilled",
+         "Written when a visitor closes the page, so a live conversation has none yet.");
     stat(stats, String(d.item_count), "documents",
          "Everything in the dataset: transcripts, lessons, and cognee's own copies");
     if (d.counts.bridged_documents) {
@@ -1865,8 +1867,7 @@
     }
     panel.appendChild(stats);
 
-    [["Lessons", d.lessons], ["Persisted sessions", d.sessions],
-     ["Turns", d.turns]].forEach(([title, rows]) => {
+    [["Lessons", d.lessons], ["Transcripts", d.sessions]].forEach(([title, rows]) => {
       if (!rows || !rows.length) return;
       const fold = document.createElement("details");
       fold.className = "pick-group";

@@ -1972,18 +1972,10 @@ def test_conversation_memory_separates_lessons_from_turns(dashboard_client, fake
     assert body["exists"] is True
     # A transcript is a session; the bridge's copies are counted apart, since
     # they hold the same turns minus whatever its watermark skipped.
-    assert body["counts"] == {
-        "sessions": 0,
-        "turns": 0,
-        "lessons": 1,
-        "bridged_documents": 2,
-    }
+    assert body["counts"] == {"sessions": 0, "lessons": 1, "bridged_documents": 2}
     assert body["lessons"][0]["label"] == "text_lesson"
     assert body["counts"]["lessons"] == 1
     # Anything the three buckets did not claim is counted, not dropped.
-    # The chunk belongs to the bridge's copy, not to a transcript, so it is not
-    # offered as a turn.
-    assert body["turns"] == []
     assert body["unclassified"] == [{"type": "Entity", "count": 2}]
 
 

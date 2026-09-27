@@ -1133,7 +1133,7 @@ def _conversation_memory(graph: dict) -> dict:
                 return part[len(prefix) :].strip("[]")
         return ""
 
-    turns, sessions, lessons, other = [], [], [], Counter()
+    sessions, lessons, other = [], [], Counter()
     bridged = 0
     for node in nodes:
         kind = str(_field(node, "type") or "unknown")
@@ -1165,10 +1165,9 @@ def _conversation_memory(graph: dict) -> dict:
         elif PERSISTED_SESSIONS_NODE_SET not in tag:
             other[kind] += 1
         elif kind in ("TextDocument", "DocumentChunk"):
-            # What the session bridge persisted. Counted apart from the
-            # transcripts rather than added to them: it holds the same turns,
-            # minus whichever ones its watermark skipped, so summing the two
-            # would report a conversation twice and still get it short.
+            # What the session bridge persisted, if it has run. Counted apart
+            # from the transcripts rather than added to them: it holds the same
+            # conversations over again, minus whatever its watermark skipped.
             bridged += 1
         else:
             # Entities and summaries cognify derives from a persisted session:
@@ -1177,14 +1176,13 @@ def _conversation_memory(graph: dict) -> dict:
 
     return {
         "sessions": sessions[:200],
-        "turns": turns[:500],
         "lessons": lessons[:200],
         "counts": {
+            # Transcripts, which is what a conversation is here.
             "sessions": len(sessions),
-            "turns": len(turns),
             "lessons": len(lessons),
-            # cognee's own copies of the same conversations, kept visible so
-            # the cognify they cost is not invisible.
+            # cognee's own copies of the same conversations, kept visible so the
+            # cognify they cost is not invisible. Zero until something distils.
             "bridged_documents": bridged,
         },
         "unclassified": [{"type": k, "count": v} for k, v in other.most_common(10)],
