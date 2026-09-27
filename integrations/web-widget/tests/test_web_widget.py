@@ -1889,9 +1889,9 @@ def test_conversation_memory_separates_lessons_from_turns(dashboard_client, fake
             "nodes": [
                 {
                     "id": "1",
-                    "type": "Lesson",
-                    "label": "Ask for the dataset name first",
-                    "properties": {},
+                    "type": "TextDocument",
+                    "label": "text_lesson",
+                    "properties": {"source_node_set": "session_learnings"},
                 },
                 {
                     "id": "2",
@@ -1914,10 +1914,51 @@ def test_conversation_memory_separates_lessons_from_turns(dashboard_client, fake
 
     assert body["exists"] is True
     assert body["counts"] == {"sessions": 1, "turns": 1, "lessons": 1}
-    assert body["lessons"][0]["label"] == "Ask for the dataset name first"
+    assert body["lessons"][0]["label"] == "text_lesson"
     # Anything the three buckets did not claim is counted, not dropped.
     assert body["turns"][0]["text"] == "Q: how do I install?"
     assert body["unclassified"] == [{"type": "Entity", "count": 2}]
+
+
+def test_lessons_are_told_apart_by_node_set_not_by_name(dashboard_client, fake_client):
+    """A lesson and a persisted session are both TextDocuments named after a
+    content hash. Matching on type or label - the first attempt - filed every
+    lesson as a session. Only the node set distinguishes them, and its
+    per-session variant says which conversation taught it."""
+    client = dashboard_client
+    fake_client.list_datasets = AsyncMock(
+        return_value=[{"name": "web:demo:conversations", "id": "d2"}]
+    )
+    fake_client.graph = AsyncMock(
+        return_value={
+            "nodes": [
+                {
+                    "id": "1",
+                    "type": "TextDocument",
+                    "label": "text_bc8c18aeac6f2b908c0354290fca9ec5",
+                    "properties": {
+                        "node_set": [
+                            "session_learnings",
+                            "session_learnings:web:demo:visitor-babepv87:conv-7d7fgmfw",
+                        ]
+                    },
+                },
+                {
+                    "id": "2",
+                    "type": "TextDocument",
+                    "label": "text_3d98bf75a0169e12a63d877f2322c709",
+                    "properties": {"node_set": ["user_sessions_from_cache"]},
+                },
+            ],
+            "edges": [],
+        }
+    )
+
+    body = client.get("/api/dashboard/conversation-memory?token=s3cret").json()
+
+    assert body["counts"]["lessons"] == 1
+    assert body["counts"]["sessions"] == 1
+    assert body["lessons"][0]["session"] == "web:demo:visitor-babepv87:conv-7d7fgmfw"
 
 
 def test_conversation_memory_reports_an_absent_dataset_as_empty(dashboard_client, fake_client):

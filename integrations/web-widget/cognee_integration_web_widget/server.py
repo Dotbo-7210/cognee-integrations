@@ -948,9 +948,11 @@ async def dashboard_ingest_repo(
     return JSONResponse({"repository": label, "url": url, "shows_in": "knowledge graph"})
 
 
-# What the session bridge writes, tagged by cognee itself
-# (cognee.modules.improve.constants.USER_SESSIONS_NODE_SET).
+# Both node sets are cognee's own, and they are the only thing telling the two
+# kinds of writing in this dataset apart: the node type is TextDocument for both
+# and the label is a content hash for both.
 PERSISTED_SESSIONS_NODE_SET = "user_sessions_from_cache"
+LESSONS_NODE_SET = "session_learnings"
 
 
 def _conversation_memory(graph: dict) -> dict:
@@ -970,10 +972,23 @@ def _conversation_memory(graph: dict) -> dict:
     """
     nodes = [n for n in (graph.get("nodes") or []) if isinstance(n, dict)]
 
-    def persisted(node) -> bool:
+    def tags(node) -> str:
         props = node.get("properties") or {}
-        tag = props.get("source_node_set") or props.get("node_set") or ""
-        return PERSISTED_SESSIONS_NODE_SET in str(tag)
+        return str(props.get("source_node_set") or props.get("node_set") or "")
+
+    def lesson_session(tag: str) -> str:
+        """The conversation a lesson was distilled from.
+
+        Distillation tags a lesson twice: ``session_learnings`` and
+        ``session_learnings:<session id>``. The second answers "which
+        conversation taught this", so it is read rather than treated as a
+        duplicate of the first.
+        """
+        prefix = LESSONS_NODE_SET + ":"
+        for part in tag.replace("'", " ").replace('"', " ").replace(",", " ").split():
+            if part.startswith(prefix):
+                return part[len(prefix) :].strip("[]")
+        return ""
 
     turns, sessions, lessons, other = [], [], [], Counter()
     for node in nodes:
@@ -986,10 +1001,20 @@ def _conversation_memory(graph: dict) -> dict:
             "type": kind,
             "text": str(props.get("text") or "")[:400],
             "at": str(props.get("created_at") or props.get("time") or ""),
+            "session": "",
         }
-        if "lesson" in kind.lower() or "lesson" in label.lower()[:40]:
-            lessons.append(entry)
-        elif not persisted(node):
+        # Read off the first real distillation rather than guessed. Matching on
+        # the type or the label - which is what this did first - filed every
+        # lesson as a persisted session, because both are TextDocuments named
+        # after their content hash.
+        tag = tags(node)
+        if LESSONS_NODE_SET in tag:
+            entry["session"] = lesson_session(tag)
+            if kind == "TextDocument":
+                lessons.append(entry)
+            else:
+                other[kind] += 1  # chunks and entities derived from a lesson
+        elif PERSISTED_SESSIONS_NODE_SET not in tag:
             other[kind] += 1
         elif kind == "TextDocument":
             sessions.append(entry)
