@@ -124,6 +124,21 @@ class ChatMemoryAdapter:
         """
         return f"web:{site_id}:conversations"
 
+    def lessons_dataset(self, site_id: str) -> str:
+        """Where distillation writes, kept apart from the transcripts.
+
+        improve() runs nine stages, and one of them persists the session's Q&A
+        into whatever dataset it is given. Pointed at the conversations corpus
+        that would duplicate every transcript we already keep - and do it
+        through the stage whose watermark loses turns. Pointed here, the
+        duplicates are somewhere harmless and the transcripts stay the only
+        record of what was said.
+
+        Recall names the docs corpus alone, so nothing distilled here reaches a
+        visitor until that list is widened deliberately.
+        """
+        return f"web:{site_id}:lessons"
+
     # -- "ask our docs" corpus ---------------------------------------------
 
     async def ingest_docs(self, *, site_id: str, documents: Sequence[str]) -> None:

@@ -222,12 +222,21 @@ def test_chat_writes_the_turn_into_the_conversation_transcript(web_client):
 
     client.post("/api/chat", json={"message": "what is cognee?", "conversation_id": "c1"})
 
-    call = fake_client.remember.await_args
-    assert call.kwargs["dataset_name"] == "web:demo:conversations"
-    assert call.kwargs["filename"] == "web:demo:anonymous:c1"
-    # No session id: this must not wake cognee's session bridge.
-    assert call.kwargs.get("session_id") is None
-    assert "Q: what is cognee?" in call.args[0]
+    calls = {c.kwargs["dataset_name"]: c for c in fake_client.remember.await_args_list}
+
+    # The transcript: named by session, and carrying no session id, so writing
+    # it cannot wake the bridge.
+    transcript = calls["web:demo:conversations"]
+    assert transcript.kwargs["filename"] == "web:demo:anonymous:c1"
+    assert transcript.kwargs.get("session_id") is None
+    assert "Q: what is cognee?" in transcript.args[0]
+
+    # The trigger: a session id, so cognee runs the improve behind it, and
+    # pointed at the lessons corpus - the bridge persists its own turn documents
+    # wherever it is aimed, and they must not land among the transcripts.
+    trigger = calls["web:demo:lessons"]
+    assert trigger.kwargs["session_id"] == "web:demo:anonymous:c1"
+    assert trigger.kwargs["run_in_background"] is True
 
 
 def test_chat_appends_to_an_existing_transcript_rather_than_replacing_it(web_client):
@@ -248,7 +257,10 @@ def test_chat_appends_to_an_existing_transcript_rather_than_replacing_it(web_cli
 
     client.post("/api/chat", json={"message": "second?", "conversation_id": "c1"})
 
-    fake_client.remember.assert_not_awaited()
+    # The transcript is patched, not rewritten; the only remember is the trigger.
+    assert [c.kwargs["dataset_name"] for c in fake_client.remember.await_args_list] == [
+        "web:demo:lessons"
+    ]
     sent = fake_client.update_document.await_args.kwargs
     assert sent["data_id"] == "doc-1"
     assert "Q: first?" in sent["text"]  # the earlier turn survives

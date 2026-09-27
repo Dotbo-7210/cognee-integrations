@@ -201,6 +201,31 @@ async def _append_to_transcript(conversation, question: str, answer: str) -> Non
     except Exception as error:  # noqa: BLE001 - the answer is already out
         print(f"[web_widget] appending to the transcript failed: {error}")
 
+    # Then distil, on the session cognee has been accumulating through recall.
+    # Separate from the transcript write and not inside its lock: the two are
+    # independent, and a failed distillation must not cost us the turn.
+    #
+    # The curator reads the session's whole timeline each run, not just what is
+    # new, so running per turn does not fragment what a lesson is drawn from -
+    # it only means the earliest runs see a shorter conversation. The watermark
+    # decides which candidates may become lessons, so nothing is distilled twice.
+    # remember() with a session id is itself the trigger: cognee launches the
+    # improve run behind it, so this is one call rather than a write and a
+    # separate distil. The text is incidental - a remember carrying a session id
+    # produced no document of its own on this tenant, twice measured - and the
+    # transcript above is the record either way.
+    lessons = adapter.lessons_dataset(conversation.site_id)
+    try:
+        await adapter.client.remember(
+            f"Q: {question}\n\nA: {answer}",
+            dataset_name=lessons,
+            session_id=name,
+            run_in_background=True,
+            filename=f"{name}-turn",
+        )
+    except Exception as error:  # noqa: BLE001 - lessons are not worth an error page
+        print(f"[web_widget] distilling {name} failed: {error}")
+
 
 async def _write_turn(dataset: str, name: str, question: str, answer: str) -> None:
     """Read the transcript, add this turn, put it back. Caller holds the lock."""
@@ -1166,26 +1191,42 @@ async def dashboard_conversations(token: Optional[str] = Query(default=None)) ->
 async def dashboard_conversation_memory(
     token: Optional[str] = Query(default=None),
 ) -> JSONResponse:
-    """What has been persisted and distilled from conversations so far."""
+    """What has been persisted and distilled from conversations so far.
+
+    Two datasets, because they hold different things: the transcripts, and what
+    distillation wrote from them. Reading both is what lets this view show a
+    lesson next to the conversation that taught it.
+    """
     _require_dashboard(token)
-    dataset = adapter.conversations_dataset(DEMO_SITE_ID)
+    conversations = adapter.conversations_dataset(DEMO_SITE_ID)
+    lessons = adapter.lessons_dataset(DEMO_SITE_ID)
     datasets = await adapter.client.list_datasets()
-    match = next((d for d in datasets if isinstance(d, dict) and d.get("name") == dataset), None)
-    if not match:
-        # Nothing has been stored yet: the dataset is created by the first
-        # exchange, so its absence is a normal empty state, not an error.
-        return JSONResponse({"dataset": dataset, "exists": False, "item_count": 0})
-    dataset_id = str(match.get("id"))
-    items, graph = await asyncio.gather(
-        adapter.client.dataset_data(dataset_id),
-        adapter.client.graph(dataset_id),
+    by_name = {str(d.get("name")): str(d.get("id")) for d in datasets if isinstance(d, dict)}
+    if conversations not in by_name and lessons not in by_name:
+        # Both are created on first use, so absence is an empty state.
+        return JSONResponse({"dataset": conversations, "exists": False, "item_count": 0})
+
+    async def graph_of(name: str) -> dict:
+        if name not in by_name:
+            return {"nodes": []}
+        return await adapter.client.graph(by_name[name])
+
+    async def items_of(name: str) -> list:
+        if name not in by_name:
+            return []
+        return await adapter.client.dataset_data(by_name[name])
+
+    items, conversation_graph, lesson_graph = await asyncio.gather(
+        items_of(conversations), graph_of(conversations), graph_of(lessons)
     )
+    merged = {"nodes": (conversation_graph.get("nodes") or []) + (lesson_graph.get("nodes") or [])}
     return JSONResponse(
         {
-            "dataset": dataset,
+            "dataset": conversations,
+            "lessons_dataset": lessons,
             "exists": True,
             "item_count": len(items),
-            **_conversation_memory(graph),
+            **_conversation_memory(merged),
         }
     )
 
