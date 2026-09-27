@@ -209,28 +209,6 @@ async def _append_to_transcript(conversation, question: str, answer: str) -> Non
     # new, so running per turn does not fragment what a lesson is drawn from -
     # it only means the earliest runs see a shorter conversation. The watermark
     # decides which candidates may become lessons, so nothing is distilled twice.
-    # remember() with a session id is itself the trigger: cognee launches the
-    # improve run behind it, so this is one call rather than a write and a
-    # separate distil. The text is incidental - a remember carrying a session id
-    # produced no document of its own on this tenant, twice measured - and the
-    # transcript above is the record either way.
-    #
-    # Same dataset as the transcript. improve's persist stage writes its own
-    # turn documents wherever it is aimed, which duplicates content we already
-    # hold, but they are named text_<hash> and the conversations view reads only
-    # documents named like a session, so they stay out of sight. Keeping lessons
-    # beside the conversations they cite is worth that: apart, clearing one left
-    # the other pointing at transcripts that no longer existed.
-    try:
-        await adapter.client.remember(
-            f"Q: {question}\n\nA: {answer}",
-            dataset_name=dataset,
-            session_id=name,
-            run_in_background=True,
-            filename=f"{name}-turn",
-        )
-    except Exception as error:  # noqa: BLE001 - lessons are not worth an error page
-        print(f"[web_widget] distilling {name} failed: {error}")
 
 
 async def _write_turn(dataset: str, name: str, question: str, answer: str) -> None:
@@ -301,6 +279,61 @@ async def chat(req: ChatRequest, background: BackgroundTasks) -> JSONResponse:
         # the work is owned by the request and cannot be dropped on shutdown.
         background.add_task(_append_to_transcript, conversation, req.message, answer.text)
     return JSONResponse(answer.as_dict())
+
+
+class EndSessionRequest(BaseModel):
+    conversation_id: str
+    visitor_id: str = "anonymous"
+    site_id: str = DEMO_SITE_ID
+    opt_in: bool = True
+
+
+async def _distil_session(conversation) -> None:
+    """Distil this conversation, now that it looks finished.
+
+    remember() with a session id is the trigger: cognee launches the improve
+    run behind it, which reads the session cache and writes lessons.
+
+    Once per conversation rather than once per turn, and that is the whole
+    point of doing it here. The curator reads the session's entire timeline on
+    every run, so running after each turn produced a fresh lesson about the same
+    material each time - a four-turn conversation left fourteen lessons covering
+    about three facts. Waiting until the visitor has gone gives one pass over
+    one finished conversation.
+    """
+    dataset = adapter.conversations_dataset(conversation.site_id)
+    try:
+        await adapter.client.remember(
+            f"End of conversation {conversation.session_id}",
+            dataset_name=dataset,
+            session_id=conversation.session_id,
+            run_in_background=True,
+            filename=f"{conversation.session_id}-end",
+        )
+    except Exception as error:  # noqa: BLE001 - nobody is waiting on this
+        print(f"[web_widget] distilling {conversation.session_id} failed: {error}")
+
+
+@app.post("/api/chat/end")
+async def chat_end(req: EndSessionRequest, background: BackgroundTasks) -> JSONResponse:
+    """The visitor closed the page: distil what the conversation taught.
+
+    Sent by the widget as a beacon on pagehide, so it is fire-and-forget by
+    nature - it cannot be awaited, retried, or reported on. A conversation whose
+    browser crashed, or was force-quit, or backgrounded on a phone that never
+    fired the event, is simply never distilled; its turns stay in the transcript
+    either way.
+
+    Nothing is distilled for a visitor who opted out, for the same reason
+    nothing was stored: there is no session to read.
+    """
+    if not req.opt_in:
+        return JSONResponse({"distilling": False, "why": "opted out"})
+    conversation = adapter.conversation(
+        site_id=req.site_id, visitor_id=req.visitor_id, conversation_id=req.conversation_id
+    )
+    background.add_task(_distil_session, conversation)
+    return JSONResponse({"distilling": True, "session_id": conversation.session_id})
 
 
 @app.post("/api/forget")

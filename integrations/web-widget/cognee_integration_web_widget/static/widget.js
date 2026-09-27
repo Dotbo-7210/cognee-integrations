@@ -200,10 +200,51 @@
       var data = await res.json();
       addMsg("bot", data.answer || "…");
       addCitations(data.citations);
+      unsent += 1;
     } catch (e) {
       addMsg("bot", "Sorry — I couldn't reach memory right now.");
     }
   }
+  // Distillation runs when the visitor leaves, not after every answer. The
+  // curator reads the whole conversation on each run, so distilling per turn
+  // wrote another lesson about the same material every time - four turns once
+  // produced fourteen lessons covering three facts. Once, at the end, gives one
+  // pass over a finished conversation.
+  //
+  // sendBeacon because a page being unloaded cancels a fetch. It is
+  // fire-and-forget by design: no response, no retry. A tab that crashes or is
+  // force-quit never sends it and that conversation is never distilled - the
+  // transcript is written per turn and is unaffected either way.
+  var unsent = 0;
+  function endConversation() {
+    if (!unsent || !optIn) return;
+    unsent = 0;
+    try {
+      navigator.sendBeacon(
+        API + "/api/chat/end",
+        new Blob(
+          [JSON.stringify({
+            conversation_id: conversationId,
+            visitor_id: visitorId,
+            site_id: SITE_ID,
+            opt_in: optIn,
+          })],
+          { type: "application/json" }
+        )
+      );
+    } catch (e) {
+      /* leaving anyway */
+    }
+  }
+  // visibilitychange is the one that fires reliably on mobile, where a tab is
+  // backgrounded rather than closed; pagehide covers the desktop close and
+  // navigation. Guarded by `unsent`, so returning to the tab and leaving again
+  // without asking anything does not distil twice.
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "hidden") endConversation();
+  });
+  window.addEventListener("pagehide", endConversation);
+
   root.querySelector("#cognee-send").onclick = send;
   input.addEventListener("keydown", function (e) {
     if (e.key === "Enter") send();

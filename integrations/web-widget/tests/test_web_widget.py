@@ -223,21 +223,14 @@ def test_chat_writes_the_turn_into_the_conversation_transcript(web_client):
     client.post("/api/chat", json={"message": "what is cognee?", "conversation_id": "c1"})
 
     calls = fake_client.remember.await_args_list
-    assert {c.kwargs["dataset_name"] for c in calls} == {"web:demo:conversations"}
-
-    # Two writes to one dataset, told apart by the session id, which is the
-    # thing that changes what cognee does with them.
-    transcript = next(c for c in calls if c.kwargs.get("session_id") is None)
-    trigger = next(c for c in calls if c.kwargs.get("session_id"))
-
-    # The transcript: named by session, no session id, so writing it cannot
-    # wake the bridge.
+    assert len(calls) == 1, "a turn writes the transcript and nothing else"
+    transcript = calls[0]
+    assert transcript.kwargs["dataset_name"] == "web:demo:conversations"
     assert transcript.kwargs["filename"] == "web:demo:anonymous:c1"
+    # No session id: answering must not wake the bridge. Distillation happens
+    # once, when the visitor leaves.
+    assert transcript.kwargs.get("session_id") is None
     assert "Q: what is cognee?" in transcript.args[0]
-
-    # The trigger: a session id, so cognee runs the improve behind it.
-    assert trigger.kwargs["session_id"] == "web:demo:anonymous:c1"
-    assert trigger.kwargs["run_in_background"] is True
 
 
 def test_chat_appends_to_an_existing_transcript_rather_than_replacing_it(web_client):
@@ -258,11 +251,8 @@ def test_chat_appends_to_an_existing_transcript_rather_than_replacing_it(web_cli
 
     client.post("/api/chat", json={"message": "second?", "conversation_id": "c1"})
 
-    # The transcript is patched, not rewritten, so the only remember left is the
-    # trigger - the one carrying a session id.
-    assert [bool(c.kwargs.get("session_id")) for c in fake_client.remember.await_args_list] == [
-        True
-    ]
+    # Patched, not rewritten, and nothing else written.
+    fake_client.remember.assert_not_awaited()
     sent = fake_client.update_document.await_args.kwargs
     assert sent["data_id"] == "doc-1"
     assert "Q: first?" in sent["text"]  # the earlier turn survives
@@ -309,6 +299,38 @@ def test_chat_cannot_be_asked_to_search_outside_the_docs_corpus(web_client):
     )
 
     assert fake_client.recall.await_args.kwargs["datasets"] == ["web:demo:docs"]
+
+
+def test_closing_the_page_distils_the_conversation(web_client):
+    """Once, when the visitor leaves. Distilling per turn wrote a fresh lesson
+    about the same material every time: four turns left fourteen lessons
+    covering about three facts."""
+    client, fake_client = web_client
+    fake_client.remember = AsyncMock(return_value=None)
+
+    body = client.post("/api/chat/end", json={"conversation_id": "c1", "visitor_id": "v1"}).json()
+
+    assert body["distilling"] is True
+    call = fake_client.remember.await_args
+    # A session id is what makes cognee run the improve behind it.
+    assert call.kwargs["session_id"] == "web:demo:v1:c1"
+    assert call.kwargs["dataset_name"] == "web:demo:conversations"
+    assert call.kwargs["run_in_background"] is True
+
+
+def test_closing_the_page_distils_nothing_for_a_visitor_who_opted_out(web_client):
+    """Nothing was stored, so there is no session to read - and asking would
+    claim an opt-out that did not hold."""
+    client, fake_client = web_client
+    fake_client.remember = AsyncMock(return_value=None)
+
+    body = client.post(
+        "/api/chat/end",
+        json={"conversation_id": "c1", "visitor_id": "v1", "opt_in": False},
+    ).json()
+
+    assert body["distilling"] is False
+    fake_client.remember.assert_not_awaited()
 
 
 def test_forget_endpoint_clears_conversation(web_client):
