@@ -125,13 +125,41 @@ class ChatRequest(BaseModel):
     visitor_id: str = "anonymous"
     site_id: str = DEMO_SITE_ID
     opt_in: bool = True
-    use_docs: bool = True
 
 
 class ForgetRequest(BaseModel):
     conversation_id: str
     visitor_id: str = "anonymous"
     site_id: str = DEMO_SITE_ID
+
+
+async def _store_exchange(conversation, question: str, answer: str) -> None:
+    """Keep this exchange, in the conversations corpus.
+
+    Two jobs in one call. It stores the turn where it outlives the session
+    cache - which holds turns for seven days of inactivity and is dropped
+    outright when its dataset is deleted - and it is the trigger for cognee's
+    session bridge, which persists the session's Q&A into that dataset's graph
+    and distils lessons from it. Nothing in cognee does that on a timer; the
+    bridge only runs because a remember() with a session id asked it to.
+
+    Not the docs corpus, so none of it can answer a visitor. In the background,
+    so the visitor does not wait on a cognify for a reply they already have. And
+    never fatal: they have the reply, and losing the record of it is not a
+    reason to hand them an error instead.
+
+    Only when the visitor opted in - the same consent that governs whether the
+    turn is remembered at all.
+    """
+    try:
+        await adapter.client.remember(
+            f"Q: {question}\n\nA: {answer}",
+            dataset_name=adapter.conversations_dataset(conversation.site_id),
+            session_id=conversation.session_id,
+            run_in_background=True,
+        )
+    except Exception as error:  # noqa: BLE001 - the answer is already out
+        print(f"[web_widget] storing the exchange failed: {error}")
 
 
 @app.post("/api/chat")
@@ -159,8 +187,9 @@ async def chat(req: ChatRequest) -> JSONResponse:
         conversation=conversation,
         query=req.message,
         remember=req.opt_in,
-        use_docs=req.use_docs,
     )
+    if req.opt_in:
+        await _store_exchange(conversation, req.message, answer.text)
     return JSONResponse(answer.as_dict())
 
 
@@ -968,6 +997,121 @@ async def dashboard_ingest_repo(
     # it will appear in the sources table. Saying where it does appear is the
     # difference between "indexed" and "apparently nothing happened".
     return JSONResponse({"repository": label, "url": url, "shows_in": "knowledge graph"})
+
+
+# What the session bridge writes, tagged by cognee itself
+# (cognee.modules.improve.constants.USER_SESSIONS_NODE_SET).
+PERSISTED_SESSIONS_NODE_SET = "user_sessions_from_cache"
+
+
+def _conversation_memory(graph: dict) -> dict:
+    """Persisted sessions, their turns, and the lessons distilled from them.
+
+    The bridge does not invent node types. It cognifies each session like any
+    other document and tags the result with cognee's own node set, so what comes
+    back is a TextDocument per session and a DocumentChunk per piece of it -
+    identified by the tag, not by a type name. Reading them apart is what makes
+    the dataset worth having: a flat node list says nothing about which
+    conversation taught what.
+
+    Lessons are matched by name because distillation writes "standalone lesson
+    documents" and this tenant has produced none yet to model against. Anything
+    unmatched is counted rather than dropped, so a shape this does not know is
+    visible instead of silently missing.
+    """
+    nodes = [n for n in (graph.get("nodes") or []) if isinstance(n, dict)]
+
+    def persisted(node) -> bool:
+        props = node.get("properties") or {}
+        tag = props.get("source_node_set") or props.get("node_set") or ""
+        return PERSISTED_SESSIONS_NODE_SET in str(tag)
+
+    turns, sessions, lessons, other = [], [], [], Counter()
+    for node in nodes:
+        kind = str(_field(node, "type") or "unknown")
+        label = str(_field(node, "label"))[:200]
+        props = node.get("properties") or {}
+        entry = {
+            "id": str(_field(node, "id")),
+            "label": label,
+            "type": kind,
+            "text": str(props.get("text") or "")[:400],
+            "at": str(props.get("created_at") or props.get("time") or ""),
+        }
+        if "lesson" in kind.lower() or "lesson" in label.lower()[:40]:
+            lessons.append(entry)
+        elif not persisted(node):
+            other[kind] += 1
+        elif kind == "TextDocument":
+            sessions.append(entry)
+        elif kind == "DocumentChunk":
+            turns.append(entry)
+        else:
+            # Entities and summaries cognify derives from a persisted session:
+            # real content, but not one of the three things this view is about.
+            other[kind] += 1
+
+    return {
+        "sessions": sessions[:200],
+        "turns": turns[:500],
+        "lessons": lessons[:200],
+        "counts": {
+            "sessions": len(sessions),
+            "turns": len(turns),
+            "lessons": len(lessons),
+        },
+        "unclassified": [{"type": k, "count": v} for k, v in other.most_common(10)],
+    }
+
+
+@app.get("/api/dashboard/conversation-memory")
+async def dashboard_conversation_memory(
+    token: Optional[str] = Query(default=None),
+) -> JSONResponse:
+    """What has been persisted and distilled from conversations so far."""
+    _require_dashboard(token)
+    dataset = adapter.conversations_dataset(DEMO_SITE_ID)
+    datasets = await adapter.client.list_datasets()
+    match = next((d for d in datasets if isinstance(d, dict) and d.get("name") == dataset), None)
+    if not match:
+        # Nothing has been stored yet: the dataset is created by the first
+        # exchange, so its absence is a normal empty state, not an error.
+        return JSONResponse({"dataset": dataset, "exists": False, "item_count": 0})
+    dataset_id = str(match.get("id"))
+    items, graph = await asyncio.gather(
+        adapter.client.dataset_data(dataset_id),
+        adapter.client.graph(dataset_id),
+    )
+    return JSONResponse(
+        {
+            "dataset": dataset,
+            "exists": True,
+            "item_count": len(items),
+            **_conversation_memory(graph),
+        }
+    )
+
+
+@app.post("/api/dashboard/clear-conversations")
+async def dashboard_clear_conversations(
+    body: ClearRequest, token: Optional[str] = Query(default=None)
+) -> JSONResponse:
+    """Delete the conversations corpus: stored exchanges, sessions, lessons.
+
+    Separate from clearing the docs corpus, and gated the same way, because it
+    holds other people's words rather than our own documents - the one thing
+    here that cannot be rebuilt by ingesting a folder again.
+
+    Deleting it also invalidates the sessions attributed to it, which is how
+    cognee keeps session memory from quoting deleted content.
+    """
+    _require_dashboard(token)
+    dataset = adapter.conversations_dataset(DEMO_SITE_ID)
+    if body.confirm != dataset:
+        raise HTTPException(status_code=400, detail=f"type the dataset name exactly: {dataset}")
+    if not await adapter.client.forget_dataset(dataset):
+        raise HTTPException(status_code=502, detail="cognee refused to clear the dataset")
+    return JSONResponse({"cleared": dataset})
 
 
 @app.get("/api/dashboard/ingest-progress")

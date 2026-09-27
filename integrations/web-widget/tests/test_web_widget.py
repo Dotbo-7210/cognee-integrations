@@ -113,11 +113,14 @@ async def test_answer_opt_out_recalls_without_session(fake_client):
     adapter = ChatMemoryAdapter(client=fake_client)
     conv = adapter.conversation(site_id="demo", visitor_id="v1", conversation_id="c1")
 
-    await adapter.answer(conversation=conv, query="hi", remember=False, use_docs=False)
+    await adapter.answer(conversation=conv, query="hi", remember=False)
 
     call = fake_client.recall.call_args
     assert call.kwargs["session_id"] is None  # nothing is persisted
-    assert call.kwargs["datasets"] is None  # docs mode off
+    # Opting out stops the session, not the scope. The dataset list is fixed:
+    # None would mean "every dataset this key can read", which is how the
+    # conversations corpus would end up answering a visitor.
+    assert call.kwargs["datasets"] == ["web:demo:docs"]
 
 
 async def test_answer_graceful_when_dataset_missing_or_empty(fake_client):
@@ -207,6 +210,64 @@ def test_chat_forget_command_is_not_answered(web_client):
     # A /forget clears the conversation and is NOT sent through recall.
     assert fake.forget.call_args.kwargs["dataset_name"] == "web:demo:anonymous:c1"
     assert fake.recall.await_count == before
+
+
+def test_chat_stores_the_exchange_away_from_the_docs_corpus(web_client):
+    """The store is also the trigger: nothing in cognee bridges a session into
+    the graph on a timer, so this remember() is what makes the turn outlive the
+    cache and what sets distillation going."""
+    client, fake_client = web_client
+    fake_client.remember = AsyncMock(return_value=None)
+
+    client.post("/api/chat", json={"message": "what is cognee?", "conversation_id": "c1"})
+
+    call = fake_client.remember.await_args
+    assert call.kwargs["dataset_name"] == "web:demo:conversations"
+    assert call.kwargs["session_id"].startswith("web:demo:")
+    # Background, or the visitor waits on a cognify for a reply they have.
+    assert call.kwargs["run_in_background"] is True
+    assert "what is cognee?" in call.args[0]
+
+
+def test_chat_stores_nothing_when_the_visitor_opted_out(web_client):
+    """The same consent that stops the turn being remembered stops it being
+    written down. An opt-out that still filed the question would be worse than
+    no opt-out, because it reads as one."""
+    client, fake_client = web_client
+    fake_client.remember = AsyncMock(return_value=None)
+
+    client.post(
+        "/api/chat",
+        json={"message": "private question", "conversation_id": "c1", "opt_in": False},
+    )
+
+    fake_client.remember.assert_not_awaited()
+
+
+def test_chat_still_answers_when_storing_the_exchange_fails(web_client):
+    """The reply is already computed; losing the record of it is not a reason to
+    hand the visitor an error instead."""
+    client, fake_client = web_client
+    fake_client.remember = AsyncMock(side_effect=RuntimeError("cognee is down"))
+
+    r = client.post("/api/chat", json={"message": "hello", "conversation_id": "c1"})
+
+    assert r.status_code == 200
+    assert r.json()["answer"]
+
+
+def test_chat_cannot_be_asked_to_search_outside_the_docs_corpus(web_client):
+    """use_docs used to be a request field, and false meant datasets=None -
+    every dataset the key can read, conversations included."""
+    client, fake_client = web_client
+    fake_client.remember = AsyncMock(return_value=None)
+
+    client.post(
+        "/api/chat",
+        json={"message": "hi", "conversation_id": "c1", "use_docs": False},
+    )
+
+    assert fake_client.recall.await_args.kwargs["datasets"] == ["web:demo:docs"]
 
 
 def test_forget_endpoint_clears_conversation(web_client):
@@ -1767,6 +1828,99 @@ def test_deleting_one_source_also_drops_the_cached_render(dashboard_client, fake
     client.delete("/api/dashboard/data/abc?token=s3cret")
 
     assert server_mod._viz_cache["html"] is None
+
+
+def test_conversation_memory_separates_lessons_from_turns(dashboard_client, fake_client):
+    """Three different things live in this dataset, and a flat node list says
+    nothing about which conversation taught what."""
+    client = dashboard_client
+    fake_client.list_datasets = AsyncMock(
+        return_value=[
+            {"name": "web:demo:docs", "id": "d1"},
+            {"name": "web:demo:conversations", "id": "d2"},
+        ]
+    )
+    # The real shapes, read off the tenant: the bridge cognifies a session like
+    # any other document and tags the result, rather than writing any
+    # session-specific node type. It is the tag that identifies them.
+    tagged = {"source_node_set": "user_sessions_from_cache"}
+    fake_client.graph = AsyncMock(
+        return_value={
+            "nodes": [
+                {
+                    "id": "1",
+                    "type": "Lesson",
+                    "label": "Ask for the dataset name first",
+                    "properties": {},
+                },
+                {
+                    "id": "2",
+                    "type": "DocumentChunk",
+                    "label": "DocumentChunk_f4112ab9",
+                    "properties": {**tagged, "text": "Q: how do I install?"},
+                },
+                {"id": "3", "type": "TextDocument", "label": "text_c4771bf6", "properties": tagged},
+                # Cognify derives these from the persisted session: real, but
+                # not one of the three things this view is about.
+                {"id": "4", "type": "Entity", "label": "installation", "properties": tagged},
+                # Untagged, so it belongs to nothing the bridge wrote.
+                {"id": "5", "type": "Entity", "label": "stray"},
+            ],
+            "edges": [],
+        }
+    )
+
+    body = client.get("/api/dashboard/conversation-memory?token=s3cret").json()
+
+    assert body["exists"] is True
+    assert body["counts"] == {"sessions": 1, "turns": 1, "lessons": 1}
+    assert body["lessons"][0]["label"] == "Ask for the dataset name first"
+    # Anything the three buckets did not claim is counted, not dropped.
+    assert body["turns"][0]["text"] == "Q: how do I install?"
+    assert body["unclassified"] == [{"type": "Entity", "count": 2}]
+
+
+def test_conversation_memory_reports_an_absent_dataset_as_empty(dashboard_client, fake_client):
+    """The dataset is created by the first opted-in exchange, so not existing is
+    a normal empty state rather than an error."""
+    client = dashboard_client
+    fake_client.list_datasets = AsyncMock(return_value=[{"name": "web:demo:docs", "id": "d1"}])
+    fake_client.graph = AsyncMock(return_value={"nodes": [], "edges": []})
+
+    body = client.get("/api/dashboard/conversation-memory?token=s3cret").json()
+
+    assert body["exists"] is False
+    fake_client.graph.assert_not_awaited()
+
+
+def test_clearing_conversations_needs_its_own_name_typed(dashboard_client, fake_client):
+    """A different corpus from the docs one, and the only one holding words we
+    cannot regenerate by ingesting a folder again."""
+    client = dashboard_client
+    fake_client.forget_dataset = AsyncMock(return_value=True)
+
+    wrong = client.post(
+        "/api/dashboard/clear-conversations?token=s3cret", json={"confirm": "web:demo:docs"}
+    )
+    assert wrong.status_code == 400
+    fake_client.forget_dataset.assert_not_awaited()
+
+    ok = client.post(
+        "/api/dashboard/clear-conversations?token=s3cret",
+        json={"confirm": "web:demo:conversations"},
+    )
+    assert ok.status_code == 200
+    assert fake_client.forget_dataset.await_args.args[0] == "web:demo:conversations"
+
+
+def test_conversation_routes_are_gated(dashboard_client):
+    assert dashboard_client.get("/api/dashboard/conversation-memory").status_code == 401
+    assert (
+        dashboard_client.post(
+            "/api/dashboard/clear-conversations", json={"confirm": "x"}
+        ).status_code
+        == 401
+    )
 
 
 def test_clear_and_ingest_are_gated(dashboard_client, fake_client):

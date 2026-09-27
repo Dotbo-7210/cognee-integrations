@@ -64,17 +64,28 @@ class CogneeHttpClient:
         self._timeout = timeout
 
     async def remember(
-        self, text: str, *, dataset_name: str, session_id: Optional[str] = None
+        self,
+        text: str,
+        *,
+        dataset_name: str,
+        session_id: Optional[str] = None,
+        run_in_background: bool = False,
     ) -> None:
         """Durably store ``text`` in ``dataset_name`` (cognee add + cognify).
 
         When ``session_id`` is set the server also attributes the memory to that
         session; the widget uses this only for conversation-scoped writes, and
         leaves it unset when seeding the shared, read-only docs corpus.
+
+        With ``run_in_background`` the call returns once cognee has accepted the
+        text rather than once the graph is built. A visitor waiting on a reply
+        must not also wait on a cognify.
         """
         data = {"datasetName": dataset_name}
         if session_id:
             data["session_id"] = session_id
+        if run_in_background:
+            data["run_in_background"] = "true"
         response = await self._request(
             "POST",
             "/api/v1/remember",

@@ -114,6 +114,16 @@ class ChatMemoryAdapter:
     def docs_dataset(self, site_id: str) -> str:
         return f"web:{site_id}:docs"
 
+    def conversations_dataset(self, site_id: str) -> str:
+        """Where exchanges are stored, and where cognee's session bridge writes.
+
+        Deliberately not the docs corpus. ``answer`` names the docs dataset and
+        nothing else, so a conversation stored here cannot become the source of
+        a later answer - which is the failure that matters: one wrong reply
+        quoted back as evidence for the next.
+        """
+        return f"web:{site_id}:conversations"
+
     # -- "ask our docs" corpus ---------------------------------------------
 
     async def ingest_docs(self, *, site_id: str, documents: Sequence[str]) -> None:
@@ -131,23 +141,30 @@ class ChatMemoryAdapter:
         conversation: Conversation,
         query: str,
         remember: bool = True,
-        use_docs: bool = True,
     ) -> Answer:
-        """Answer a query, scoped to this conversation and (optionally) the docs.
+        """Answer a query, scoped to this conversation and the docs corpus.
 
         With ``remember=True`` the ``session_id`` is passed so cognee's
         session-aware recall both uses and persists this conversation's history.
         ``remember=False`` is the opt-out: the turn is answered statelessly and
         nothing is stored.
 
+        The turn is stored by the caller, not here: ``answer`` stays a read.
+
         A docs corpus that was never seeded is reported by the server as a 4xx,
         which the HTTP client maps to no results — so the widget degrades to an
         "empty memory" answer rather than erroring.
         """
         session_id = conversation.session_id if remember else None
-        datasets = [self.docs_dataset(conversation.site_id)] if use_docs else None
+        # The dataset list is fixed here rather than taken from the caller.
+        # ``None`` means "every dataset this key can read", which would let the
+        # conversations corpus - and anything distilled from it - answer a
+        # visitor. Structural, not a default someone can switch off.
         results = await self.client.recall(
-            query, datasets=datasets, session_id=session_id, top_k=self.top_k
+            query,
+            datasets=[self.docs_dataset(conversation.site_id)],
+            session_id=session_id,
+            top_k=self.top_k,
         )
         text, citations = split_evidence(_answer_text(results), self.docs_base_url)
         return Answer(text=text, citations=citations, session_id=conversation.session_id)

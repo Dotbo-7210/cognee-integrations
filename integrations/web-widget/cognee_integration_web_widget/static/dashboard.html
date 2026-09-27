@@ -365,6 +365,7 @@
     <p id="sources-more"></p>
   </div>
   <div id="tab-repos" hidden><div id="corpus-repos"></div></div>
+  <div id="tab-convo" hidden><div id="corpus-convo"></div></div>
 </section>
 
 <section class="an">
@@ -1733,6 +1734,8 @@
   // then the count is not zero, it is unknown - showing 0 would report "none
   // indexed" for a corpus that has one.
   let reposKnown = false;
+  let memoryKnown = false;
+  let memoryCount = 0;
 
   function renderCorpusTabs() {
     const bar = $("#corpus-tabs");
@@ -1741,7 +1744,9 @@
     // first - they come off a cache in a millisecond while the corpus is a
     // round trip - so whichever is still missing would otherwise claim none.
     [["files", "Documentation & files", corpus ? corpus.item_count : "\u2026"],
-     ["repos", "Repositories", reposKnown ? repoCount : "\u2026"]].forEach(([key, label, n]) => {
+     ["repos", "Repositories", reposKnown ? repoCount : "\u2026"],
+     ["convo", "Conversation memory", memoryKnown ? memoryCount : "\u2026"]]
+      .forEach(([key, label, n]) => {
       const b = document.createElement("button");
       b.setAttribute("role", "tab");
       b.setAttribute("aria-selected", String(corpusTab === key));
@@ -1755,6 +1760,8 @@
     });
     $("#tab-files").hidden = corpusTab !== "files";
     $("#tab-repos").hidden = corpusTab !== "repos";
+    $("#tab-convo").hidden = corpusTab !== "convo";
+    if (corpusTab === "convo" && !memoryKnown) loadConversationMemory();
   }
 
   function showReposLoading() {
@@ -1807,6 +1814,159 @@
     }
     box.appendChild(panel);
     renderCorpusTabs();
+  }
+
+  // Fetched when the tab is first opened, not on load: it reads a second
+  // dataset's graph, and most visits never look at it.
+  async function loadConversationMemory() {
+    memoryKnown = true;
+    const box = $("#corpus-convo");
+    box.textContent = "";
+    const wait = document.createElement("p");
+    wait.className = "repo-empty";
+    wait.appendChild(text("Reading the conversations dataset\u2026"));
+    box.appendChild(wait);
+    let d;
+    try {
+      d = await fetch(api("/api/dashboard/conversation-memory")).then((r) => r.json());
+    } catch (e) {
+      wait.textContent = "";
+      wait.appendChild(text("Could not read it: " + e.message));
+      return;
+    }
+    renderConversationMemory(d);
+  }
+
+  function renderConversationMemory(d) {
+    const box = $("#corpus-convo");
+    box.textContent = "";
+    const panel = document.createElement("div");
+    panel.className = "panel pad";
+
+    if (!d.exists) {
+      const p = document.createElement("p");
+      p.className = "repo-empty";
+      p.appendChild(text(
+        "Nothing stored yet. The dataset is created by the first exchange a " +
+        "visitor opts into, and cognee's bridge fills it from there \u2014 the " +
+        "conversation turns it lifted out of the session cache, and the lessons " +
+        "it distilled from them."));
+      panel.appendChild(p);
+      box.appendChild(panel);
+      memoryCount = 0;
+      renderCorpusTabs();
+      return;
+    }
+
+    memoryCount = d.item_count || 0;
+    const stats = document.createElement("div");
+    stats.className = "stats";
+    stat(stats, String(d.counts.sessions), "sessions persisted");
+    stat(stats, String(d.counts.turns), "turns");
+    // The reason the dataset exists: what the conversations taught.
+    stat(stats, String(d.counts.lessons), "lessons distilled");
+    stat(stats, String(d.item_count), "stored exchanges",
+         "Written by the widget as each answer went out");
+    panel.appendChild(stats);
+
+    [["Lessons", d.lessons], ["Persisted sessions", d.sessions],
+     ["Turns", d.turns]].forEach(([title, rows]) => {
+      if (!rows || !rows.length) return;
+      const fold = document.createElement("details");
+      fold.className = "pick-group";
+      fold.open = title === "Lessons";
+      const head = document.createElement("summary");
+      head.className = "pick-folder";
+      head.appendChild(text(title + "  (" + rows.length + ")"));
+      fold.appendChild(head);
+      rows.slice(0, 100).forEach((r) => {
+        const row = document.createElement("div");
+        row.className = "pick-file";
+        row.appendChild(text(r.label || r.id));
+        const note = document.createElement("span");
+        note.className = "muted";
+        note.appendChild(text([r.session, r.at && ago(r.at)].filter(Boolean).join(" \u00b7 ")));
+        row.appendChild(note);
+        fold.appendChild(row);
+      });
+      panel.appendChild(fold);
+    });
+
+    if (d.unclassified && d.unclassified.length) {
+      const note = document.createElement("p");
+      note.className = "chart-note";
+      note.appendChild(text(
+        "Also in this dataset, not recognised as any of the three: " +
+        d.unclassified.map((u) => u.type + " \u00d7 " + u.count).join(", ") + "."));
+      panel.appendChild(note);
+    }
+
+    const clear = document.createElement("p");
+    clear.className = "pick-bar";
+    const btn = document.createElement("button");
+    btn.className = "danger";
+    btn.appendChild(text("Clear conversations"));
+    btn.title = "Delete stored exchanges, persisted sessions and distilled lessons";
+    btn.onclick = () => clearConversations(box, d.dataset);
+    clear.appendChild(btn);
+    panel.appendChild(clear);
+
+    box.appendChild(panel);
+    renderCorpusTabs();
+  }
+
+  function clearConversations(box, name) {
+    const wrap = document.createElement("div");
+    wrap.className = "panel";
+    const warn = document.createElement("p");
+    warn.className = "notice";
+    warn.appendChild(text(
+      "Deleting \u201c" + name + "\u201d removes the stored exchanges, the sessions " +
+      "persisted out of the cache, and every lesson distilled from them. Unlike the " +
+      "docs corpus this cannot be rebuilt by ingesting a folder again \u2014 it is " +
+      "what visitors said. It also invalidates the sessions attributed to it."));
+    const row = document.createElement("div");
+    row.className = "confirm-row";
+    const field = document.createElement("input");
+    field.type = "text";
+    field.placeholder = "type " + name + " to confirm";
+    const go = document.createElement("button");
+    go.className = "danger";
+    go.appendChild(text("Delete conversations"));
+    go.disabled = true;
+    const cancel = document.createElement("button");
+    cancel.appendChild(text("Cancel"));
+    cancel.onclick = () => { memoryKnown = false; loadConversationMemory(); };
+    field.oninput = () => { go.disabled = field.value !== name; };
+    go.onclick = async () => {
+      [field, go, cancel].forEach((c) => (c.disabled = true));
+      const status = document.createElement("p");
+      status.className = "notice";
+      status.appendChild(text("Clearing " + name + "\u2026"));
+      wrap.appendChild(status);
+      try {
+        const r = await fetch(api("/api/dashboard/clear-conversations"), {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ confirm: name }),
+        });
+        const body = await r.json();
+        if (!r.ok) throw new Error(body.detail || "HTTP " + r.status);
+        status.textContent = "";
+        status.appendChild(text(
+          "Cleared. cognee drains it in the background, so counts settle over the " +
+          "next few minutes."));
+        memoryKnown = false;
+      } catch (e) {
+        status.textContent = "";
+        status.appendChild(text("Clear failed: " + e.message));
+        [field, go, cancel].forEach((c) => (c.disabled = false));
+      }
+    };
+    row.append(field, go, cancel);
+    wrap.append(warn, row);
+    box.textContent = "";
+    box.appendChild(wrap);
+    field.focus();
   }
 
   function prefetchComposition(force) {
