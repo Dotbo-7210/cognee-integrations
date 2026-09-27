@@ -28,9 +28,7 @@
   // The conversation is this window. localStorage held it too, and localStorage
   // is per origin: every tab on the site continued one endless conversation,
   // and a second window joined whatever the first was saying. sessionStorage is
-  // per tab, survives a reload, and dies with the tab - the same boundary the
-  // end-of-conversation beacon uses, so a conversation and its distillation
-  // start and finish together.
+  // per tab, survives a reload, and dies with the tab.
   function id(store, key, prefix) {
     var v = null;
     try {
@@ -227,128 +225,10 @@
       var data = await res.json();
       addMsg("bot", data.answer || "…");
       addCitations(data.citations);
-      setUnsent(unsent + 1);
     } catch (e) {
       addMsg("bot", "Sorry — I couldn't reach memory right now.");
     }
   }
-  // Distillation runs when the visitor leaves, not after every answer. The
-  // curator reads the whole conversation on each run, so distilling per turn
-  // wrote another lesson about the same material every time - four turns once
-  // produced fourteen lessons covering three facts. Once, at the end, gives one
-  // pass over a finished conversation.
-  //
-  // sendBeacon because a page being unloaded cancels a fetch. It is
-  // fire-and-forget by design: no response, no retry. A tab that crashes or is
-  // force-quit never sends it and that conversation is never distilled - the
-  // transcript is written per turn and is unaffected either way.
-  //
-  // The count lives in sessionStorage, next to the conversation id, because the
-  // conversation outlives the page: a reload or a link to another docs page
-  // keeps it going. Held in a variable it reset on every page, so a question
-  // asked before navigating was never distilled if the visitor closed the tab
-  // without asking another.
-  function readUnsent() {
-    try {
-      return parseInt(sessionStorage.getItem("cognee_unsent_turns"), 10) || 0;
-    } catch (e) {
-      return 0;
-    }
-  }
-  function setUnsent(n) {
-    unsent = n;
-    try {
-      sessionStorage.setItem("cognee_unsent_turns", String(n));
-    } catch (e) {
-      /* storage blocked: the count lives as long as this page does */
-    }
-  }
-  var unsent = readUnsent();
-
-  // pagehide cannot tell a closed tab from a reload or a click to another page
-  // of the site, and both of those carry the conversation on. Distilling there
-  // ran the curator over a conversation that was still going, and again at
-  // every page after. So note when the page is about to be replaced by one
-  // that continues the conversation, and let only the other departures through.
-  var stayingAt = 0;
-  function staying() {
-    stayingAt = Date.now();
-  }
-  function isStaying() {
-    // Bounded, because a navigation can be noted and then never happen: a
-    // handler cancels it, or it is a download. Left open, that would swallow
-    // the real close later on.
-    return Date.now() - stayingAt < 10000;
-  }
-  if (window.navigation && navigation.addEventListener) {
-    navigation.addEventListener("navigate", function (e) {
-      // Same-document navigations are the docs' own client-side routing; the
-      // page is not going anywhere and pagehide will not fire.
-      if (e.destination.sameDocument) return;
-      var sameSite = false;
-      try {
-        sameSite = new URL(e.destination.url).origin === window.location.origin;
-      } catch (err) {
-        /* unparseable: treat it as leaving */
-      }
-      if (sameSite || e.navigationType === "reload") staying();
-    });
-  }
-  // Where the Navigation API is missing: same-site links, checked after the
-  // page's own handlers so a click the router took over does not count.
-  window.addEventListener("click", function (e) {
-    if (e.defaultPrevented) return;
-    var a = e.target && e.target.closest && e.target.closest("a[href]");
-    if (!a || a.target === "_blank" || a.hasAttribute("download")) return;
-    if (a.origin === window.location.origin) staying();
-  });
-  // A reload from the browser's own button reaches neither of the above; the
-  // keyboard shortcuts at least are catchable.
-  window.addEventListener("keydown", function (e) {
-    if (e.key === "F5" || ((e.metaKey || e.ctrlKey) && (e.key === "r" || e.key === "R"))) {
-      staying();
-    }
-  });
-
-  function endConversation(e) {
-    // persisted: the page went into the back/forward cache and can come back
-    // as it was, conversation and all. That is not the conversation ending.
-    if (e && e.persisted) return;
-    if (isStaying()) return;
-    if (!unsent || !optIn) return;
-    setUnsent(0);
-    try {
-      navigator.sendBeacon(
-        API + "/api/chat/end",
-        new Blob(
-          [JSON.stringify({
-            conversation_id: conversationId,
-            visitor_id: visitorId,
-            site_id: SITE_ID,
-            opt_in: optIn,
-          })],
-          // text/plain keeps this a "simple" cross-origin request. With
-          // application/json the browser preflights, and a beacon cannot
-          // outlive a preflight: the OPTIONS goes out, the page finishes
-          // unloading, and the POST never follows. The body is still JSON.
-          { type: "text/plain;charset=UTF-8" }
-        )
-      );
-    } catch (e) {
-      /* leaving anyway */
-    }
-  }
-  // pagehide only, filtered above to the page actually closing. visibilitychange fired on every tab switch, and each one
-  // distilled the whole accumulated conversation again: three of them over a
-  // ten-turn thread wrote thirty-five lessons in a minute, all restating the
-  // same few facts. Reading a docs page means switching tabs constantly, so
-  // that event is not a conversation ending - it is a visitor looking at
-  // something else.
-  //
-  // The cost is mobile, where a backgrounded tab may be discarded without ever
-  // firing pagehide, and those conversations are never distilled. Their
-  // transcripts are written per turn regardless.
-  window.addEventListener("pagehide", endConversation);
 
   root.querySelector("#cognee-send").onclick = send;
   input.addEventListener("keydown", function (e) {
