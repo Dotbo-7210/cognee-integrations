@@ -214,11 +214,17 @@ async def _append_to_transcript(conversation, question: str, answer: str) -> Non
     # separate distil. The text is incidental - a remember carrying a session id
     # produced no document of its own on this tenant, twice measured - and the
     # transcript above is the record either way.
-    lessons = adapter.lessons_dataset(conversation.site_id)
+    #
+    # Same dataset as the transcript. improve's persist stage writes its own
+    # turn documents wherever it is aimed, which duplicates content we already
+    # hold, but they are named text_<hash> and the conversations view reads only
+    # documents named like a session, so they stay out of sight. Keeping lessons
+    # beside the conversations they cite is worth that: apart, clearing one left
+    # the other pointing at transcripts that no longer existed.
     try:
         await adapter.client.remember(
             f"Q: {question}\n\nA: {answer}",
-            dataset_name=lessons,
+            dataset_name=dataset,
             session_id=name,
             run_in_background=True,
             filename=f"{name}-turn",
@@ -1095,6 +1101,7 @@ def _conversation_memory(graph: dict) -> dict:
         return ""
 
     turns, sessions, lessons, other = [], [], [], Counter()
+    bridged = 0
     for node in nodes:
         kind = str(_field(node, "type") or "unknown")
         label = str(_field(node, "label"))[:200]
@@ -1118,12 +1125,18 @@ def _conversation_memory(graph: dict) -> dict:
                 lessons.append(entry)
             else:
                 other[kind] += 1  # chunks and entities derived from a lesson
+        elif label.startswith("web:"):
+            # A transcript, written by us and named after its conversation. The
+            # authoritative record: it has every turn.
+            sessions.append(entry)
         elif PERSISTED_SESSIONS_NODE_SET not in tag:
             other[kind] += 1
-        elif kind == "TextDocument":
-            sessions.append(entry)
-        elif kind == "DocumentChunk":
-            turns.append(entry)
+        elif kind in ("TextDocument", "DocumentChunk"):
+            # What the session bridge persisted. Counted apart from the
+            # transcripts rather than added to them: it holds the same turns,
+            # minus whichever ones its watermark skipped, so summing the two
+            # would report a conversation twice and still get it short.
+            bridged += 1
         else:
             # Entities and summaries cognify derives from a persisted session:
             # real content, but not one of the three things this view is about.
@@ -1137,6 +1150,9 @@ def _conversation_memory(graph: dict) -> dict:
             "sessions": len(sessions),
             "turns": len(turns),
             "lessons": len(lessons),
+            # cognee's own copies of the same conversations, kept visible so
+            # the cognify they cost is not invisible.
+            "bridged_documents": bridged,
         },
         "unclassified": [{"type": k, "count": v} for k, v in other.most_common(10)],
     }
@@ -1191,42 +1207,25 @@ async def dashboard_conversations(token: Optional[str] = Query(default=None)) ->
 async def dashboard_conversation_memory(
     token: Optional[str] = Query(default=None),
 ) -> JSONResponse:
-    """What has been persisted and distilled from conversations so far.
-
-    Two datasets, because they hold different things: the transcripts, and what
-    distillation wrote from them. Reading both is what lets this view show a
-    lesson next to the conversation that taught it.
-    """
+    """What is in the conversations corpus: transcripts, turns, and lessons."""
     _require_dashboard(token)
-    conversations = adapter.conversations_dataset(DEMO_SITE_ID)
-    lessons = adapter.lessons_dataset(DEMO_SITE_ID)
+    dataset = adapter.conversations_dataset(DEMO_SITE_ID)
     datasets = await adapter.client.list_datasets()
-    by_name = {str(d.get("name")): str(d.get("id")) for d in datasets if isinstance(d, dict)}
-    if conversations not in by_name and lessons not in by_name:
-        # Both are created on first use, so absence is an empty state.
-        return JSONResponse({"dataset": conversations, "exists": False, "item_count": 0})
+    match = next((d for d in datasets if isinstance(d, dict) and d.get("name") == dataset), None)
+    if not match:
+        # Created by the first stored exchange, so absence is an empty state.
+        return JSONResponse({"dataset": dataset, "exists": False, "item_count": 0})
 
-    async def graph_of(name: str) -> dict:
-        if name not in by_name:
-            return {"nodes": []}
-        return await adapter.client.graph(by_name[name])
-
-    async def items_of(name: str) -> list:
-        if name not in by_name:
-            return []
-        return await adapter.client.dataset_data(by_name[name])
-
-    items, conversation_graph, lesson_graph = await asyncio.gather(
-        items_of(conversations), graph_of(conversations), graph_of(lessons)
+    dataset_id = str(match.get("id"))
+    items, graph = await asyncio.gather(
+        adapter.client.dataset_data(dataset_id), adapter.client.graph(dataset_id)
     )
-    merged = {"nodes": (conversation_graph.get("nodes") or []) + (lesson_graph.get("nodes") or [])}
     return JSONResponse(
         {
-            "dataset": conversations,
-            "lessons_dataset": lessons,
+            "dataset": dataset,
             "exists": True,
             "item_count": len(items),
-            **_conversation_memory(merged),
+            **_conversation_memory(graph),
         }
     )
 

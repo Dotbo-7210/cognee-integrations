@@ -1852,12 +1852,17 @@
     memoryCount = d.item_count || 0;
     const stats = document.createElement("div");
     stats.className = "stats";
-    stat(stats, String(d.counts.sessions), "sessions persisted");
+    stat(stats, String(d.counts.sessions), "conversations");
     stat(stats, String(d.counts.turns), "turns");
     // The reason the dataset exists: what the conversations taught.
     stat(stats, String(d.counts.lessons), "lessons distilled");
-    stat(stats, String(d.item_count), "stored exchanges",
-         "Written by the widget as each answer went out");
+    stat(stats, String(d.item_count), "documents",
+         "Everything in the dataset: transcripts, lessons, and cognee's own copies");
+    if (d.counts.bridged_documents) {
+      stat(stats, String(d.counts.bridged_documents), "cognee copies",
+           "cognee's session bridge persists the same conversations again. " +
+           "Counted apart: they hold the same turns minus any its watermark skipped.");
+    }
     panel.appendChild(stats);
 
     [["Lessons", d.lessons], ["Persisted sessions", d.sessions],
@@ -1912,10 +1917,11 @@
     const warn = document.createElement("p");
     warn.className = "notice";
     warn.appendChild(text(
-      "Deleting \u201c" + name + "\u201d removes the stored exchanges, the sessions " +
-      "persisted out of the cache, and every lesson distilled from them. Unlike the " +
-      "docs corpus this cannot be rebuilt by ingesting a folder again \u2014 it is " +
-      "what visitors said. It also invalidates the sessions attributed to it."));
+      "Deleting \u201c" + name + "\u201d removes every transcript and every lesson " +
+      "distilled from them \u2014 they share this dataset, so one clear disposes of " +
+      "both and no lesson is left citing a conversation that no longer exists. Unlike " +
+      "the docs corpus this cannot be rebuilt by ingesting a folder again: it is what " +
+      "visitors said. It also invalidates the sessions attributed to it."));
     const row = document.createElement("div");
     row.className = "confirm-row";
     const field = document.createElement("input");

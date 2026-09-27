@@ -117,27 +117,16 @@ class ChatMemoryAdapter:
     def conversations_dataset(self, site_id: str) -> str:
         """Where exchanges are stored, and where cognee's session bridge writes.
 
+        Transcripts, the lessons distilled from them, and whatever the session
+        bridge writes alongside: one dataset, so a lesson cannot outlive the
+        conversation it cites and one clear disposes of all of it.
+
         Deliberately not the docs corpus. ``answer`` names the docs dataset and
-        nothing else, so a conversation stored here cannot become the source of
-        a later answer - which is the failure that matters: one wrong reply
-        quoted back as evidence for the next.
+        nothing else, so nothing stored here can become the source of a later
+        answer - which is the failure that matters: one wrong reply quoted back
+        as evidence for the next.
         """
         return f"web:{site_id}:conversations"
-
-    def lessons_dataset(self, site_id: str) -> str:
-        """Where distillation writes, kept apart from the transcripts.
-
-        improve() runs nine stages, and one of them persists the session's Q&A
-        into whatever dataset it is given. Pointed at the conversations corpus
-        that would duplicate every transcript we already keep - and do it
-        through the stage whose watermark loses turns. Pointed here, the
-        duplicates are somewhere harmless and the transcripts stay the only
-        record of what was said.
-
-        Recall names the docs corpus alone, so nothing distilled here reaches a
-        visitor until that list is widened deliberately.
-        """
-        return f"web:{site_id}:lessons"
 
     # -- "ask our docs" corpus ---------------------------------------------
 

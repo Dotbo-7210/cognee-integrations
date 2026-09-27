@@ -222,19 +222,20 @@ def test_chat_writes_the_turn_into_the_conversation_transcript(web_client):
 
     client.post("/api/chat", json={"message": "what is cognee?", "conversation_id": "c1"})
 
-    calls = {c.kwargs["dataset_name"]: c for c in fake_client.remember.await_args_list}
+    calls = fake_client.remember.await_args_list
+    assert {c.kwargs["dataset_name"] for c in calls} == {"web:demo:conversations"}
 
-    # The transcript: named by session, and carrying no session id, so writing
-    # it cannot wake the bridge.
-    transcript = calls["web:demo:conversations"]
+    # Two writes to one dataset, told apart by the session id, which is the
+    # thing that changes what cognee does with them.
+    transcript = next(c for c in calls if c.kwargs.get("session_id") is None)
+    trigger = next(c for c in calls if c.kwargs.get("session_id"))
+
+    # The transcript: named by session, no session id, so writing it cannot
+    # wake the bridge.
     assert transcript.kwargs["filename"] == "web:demo:anonymous:c1"
-    assert transcript.kwargs.get("session_id") is None
     assert "Q: what is cognee?" in transcript.args[0]
 
-    # The trigger: a session id, so cognee runs the improve behind it, and
-    # pointed at the lessons corpus - the bridge persists its own turn documents
-    # wherever it is aimed, and they must not land among the transcripts.
-    trigger = calls["web:demo:lessons"]
+    # The trigger: a session id, so cognee runs the improve behind it.
     assert trigger.kwargs["session_id"] == "web:demo:anonymous:c1"
     assert trigger.kwargs["run_in_background"] is True
 
@@ -257,9 +258,10 @@ def test_chat_appends_to_an_existing_transcript_rather_than_replacing_it(web_cli
 
     client.post("/api/chat", json={"message": "second?", "conversation_id": "c1"})
 
-    # The transcript is patched, not rewritten; the only remember is the trigger.
-    assert [c.kwargs["dataset_name"] for c in fake_client.remember.await_args_list] == [
-        "web:demo:lessons"
+    # The transcript is patched, not rewritten, so the only remember left is the
+    # trigger - the one carrying a session id.
+    assert [bool(c.kwargs.get("session_id")) for c in fake_client.remember.await_args_list] == [
+        True
     ]
     sent = fake_client.update_document.await_args.kwargs
     assert sent["data_id"] == "doc-1"
@@ -1946,10 +1948,20 @@ def test_conversation_memory_separates_lessons_from_turns(dashboard_client, fake
     body = client.get("/api/dashboard/conversation-memory?token=s3cret").json()
 
     assert body["exists"] is True
-    assert body["counts"] == {"sessions": 1, "turns": 1, "lessons": 1}
+    # A transcript is a session; the bridge's copies are counted apart, since
+    # they hold the same turns minus whatever its watermark skipped.
+    assert body["counts"] == {
+        "sessions": 0,
+        "turns": 0,
+        "lessons": 1,
+        "bridged_documents": 2,
+    }
     assert body["lessons"][0]["label"] == "text_lesson"
+    assert body["counts"]["lessons"] == 1
     # Anything the three buckets did not claim is counted, not dropped.
-    assert body["turns"][0]["text"] == "Q: how do I install?"
+    # The chunk belongs to the bridge's copy, not to a transcript, so it is not
+    # offered as a turn.
+    assert body["turns"] == []
     assert body["unclassified"] == [{"type": "Entity", "count": 2}]
 
 
@@ -1990,7 +2002,7 @@ def test_lessons_are_told_apart_by_node_set_not_by_name(dashboard_client, fake_c
     body = client.get("/api/dashboard/conversation-memory?token=s3cret").json()
 
     assert body["counts"]["lessons"] == 1
-    assert body["counts"]["sessions"] == 1
+    assert body["counts"]["bridged_documents"] == 1
     assert body["lessons"][0]["session"] == "web:demo:visitor-babepv87:conv-7d7fgmfw"
 
 
