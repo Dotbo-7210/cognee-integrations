@@ -187,8 +187,7 @@ def test_every_hook_runs_the_launcher_from_the_plugin_root(hooks, adapter):
             assert launcher == "./scripts/run-cursor-hook", entry["command"]
             assert args and args[0] in adapter.EVENT_FOR_SCRIPT, entry["command"]
             assert all(flag.startswith("--") for flag in args[1:]), entry["command"]
-            if args[0] != adapter.CACHE_RESPONSE:
-                assert (SCRIPTS_DIR / args[0]).is_file(), args[0]
+            assert (SCRIPTS_DIR / args[0]).is_file(), args[0]
 
 
 def test_hooks_json_matches_the_adapter_hook_table(hooks, adapter):
@@ -205,10 +204,13 @@ def test_hooks_json_matches_the_adapter_hook_table(hooks, adapter):
 def test_the_expected_lifecycle_is_covered(hooks):
     events = set(hooks["hooks"])
     assert {"sessionStart", "beforeSubmitPrompt", "postToolUse", "stop", "sessionEnd"} <= events
-    assert "afterAgentResponse" in events, "stop has no assistant text; the answer comes from here"
     assert "preToolUse" not in events, "a memory plugin must not gate tool calls"
     assert "beforeShellExecution" not in events
     assert "beforeMCPExecution" not in events
+    # The QA pair is stored from afterAgentResponse (the end-of-turn hook the
+    # IDE fires, carrying the answer text); stop is only the fallback.
+    after_scripts = [shlex.split(e["command"])[1:] for e in hooks["hooks"]["afterAgentResponse"]]
+    assert after_scripts == [["store-to-session.py", "--stop"]]
     stop_scripts = [shlex.split(e["command"])[1:] for e in hooks["hooks"]["stop"]]
     assert ["store-to-session.py", "--stop"] in stop_scripts
     end_scripts = [shlex.split(e["command"])[1:] for e in hooks["hooks"]["sessionEnd"]]

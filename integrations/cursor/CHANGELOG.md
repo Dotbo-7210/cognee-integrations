@@ -18,11 +18,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
   and the shared Cognee hook scripts: `conversation_id` → `session_id`,
   `generation_id` → `turn_id`, `workspace_roots` → `cwd`, Cursor tool names
   (`Shell`, `Task`, `MCP:<tool>`) → the names the capture policy knows, JSON
-  string `tool_input` / `tool_output` decoded. `stop` has no assistant text in
-  Cursor, so the final answer is taken from the `afterAgentResponse` hook (cached
-  per conversation under `~/.cognee-plugin/cursor/responses/`) or, failing that,
-  from the tail of Cursor's JSONL transcript. Replies are translated to what
-  Cursor documents per hook; `stop` never returns a `followup_message`, and every
+  string `tool_input` / `tool_output` decoded. The prompt/answer pair is stored
+  from `afterAgentResponse` — the end-of-turn hook the Cursor IDE actually fires
+  (its `stop` was never observed to launch, IDE 3.16.17 / CLI 2026.09.26) and
+  the one carrying the answer `text`. `stop` is a fallback: it skips a turn
+  `afterAgentResponse` already stored (marker under
+  `~/.cognee-plugin/cursor/responses/`) and otherwise scrapes the answer from the
+  tail of Cursor's JSONL transcript. Replies are translated to what Cursor
+  documents per hook; `stop` never returns a `followup_message`, and every
   failure prints the neutral reply and exits 0.
 - Hooks registered: `sessionStart`, `beforeSubmitPrompt` (recall + prompt park),
   `postToolUse`, `postToolUseFailure`, `afterAgentResponse`, `stop`, `preCompact`,

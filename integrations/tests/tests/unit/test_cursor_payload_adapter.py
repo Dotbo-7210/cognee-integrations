@@ -184,22 +184,69 @@ def test_non_object_tool_input_becomes_an_empty_dict(adapter):
     assert adapter.normalize_payload(payload, "store-to-session.py")["tool_input"] == {}
 
 
-def test_stop_uses_the_cached_after_agent_response_first(adapter, tmp_path):
+def test_after_agent_response_runs_the_stop_store_with_its_text(adapter):
+    """The QA pair is stored from afterAgentResponse: it is the end-of-turn hook
+    Cursor's IDE actually fires, and it carries the answer."""
+    payload = _payload("afterAgentResponse", text="the answer")
+    normalized = adapter.normalize_payload(payload, "store-to-session.py", ("--stop",))
+    assert normalized["hook_event_name"] == "Stop"
+    assert normalized["assistant_message"] == "the answer"
+    assert normalized["last_assistant_message"] == "the answer"
+    assert normalized["stop_hook_active"] is False
+    assert normalized["turn_id"] == "gen-7"
+    assert not adapter.should_skip(normalized, "store-to-session.py", ("--stop",))
+    # Without text there is nothing to store; no transcript scraping either.
+    empty = adapter.normalize_payload(
+        _payload("afterAgentResponse", text=""), "store-to-session.py", ("--stop",)
+    )
+    assert "assistant_message" not in empty
+    assert adapter.should_skip(empty, "store-to-session.py", ("--stop",))
+
+
+def test_stop_skips_a_turn_after_agent_response_already_stored(adapter, tmp_path):
     transcript = _write_transcript(
         tmp_path / "t.jsonl",
         _user("question"),
         _assistant({"type": "text", "text": "from transcript"}),
     )
-    adapter.cache_response("conv-123", "from afterAgentResponse")
+    assert adapter.mark_answer_stored("conv-123", "gen-7") is not None
     payload = _payload("stop", status="completed", loop_count=0, transcript_path=str(transcript))
     normalized = adapter.normalize_payload(payload, "store-to-session.py", ("--stop",))
     assert normalized["hook_event_name"] == "Stop"
-    assert normalized["assistant_message"] == "from afterAgentResponse"
-    assert normalized["last_assistant_message"] == "from afterAgentResponse"
     assert normalized["status"] == "completed"
-    assert normalized["stop_hook_active"] is False
-    # The cache is consumed: the next stop must not reuse a stale answer.
-    assert adapter.pop_cached_response("conv-123") == ""
+    assert "assistant_message" not in normalized
+    assert normalized["answer_already_stored"] is True
+    assert adapter.should_skip(normalized, "store-to-session.py", ("--stop",))
+    # The marker is consumed: the next stop falls back to the transcript again.
+    again = adapter.normalize_payload(payload, "store-to-session.py", ("--stop",))
+    assert again["assistant_message"] == "from transcript"
+
+
+def test_a_stale_marker_from_another_turn_does_not_suppress_stop(adapter, tmp_path):
+    transcript = _write_transcript(
+        tmp_path / "t.jsonl", _user("q"), _assistant({"type": "text", "text": "answer"})
+    )
+    adapter.mark_answer_stored("conv-123", "gen-OLD", root=tmp_path)
+    assert adapter.consume_stored_marker("conv-123", "gen-7", root=tmp_path) is False
+    assert adapter.consume_stored_marker("conv-123", "gen-7", root=tmp_path) is False  # gone
+    # Either side without a turn id (headless CLI) counts as the same turn.
+    adapter.mark_answer_stored("conv-123", "", root=tmp_path)
+    assert adapter.consume_stored_marker("conv-123", "gen-7", root=tmp_path) is True
+    adapter.mark_answer_stored("conv-123", "gen-7", root=tmp_path)
+    assert adapter.consume_stored_marker("conv-123", "", root=tmp_path) is True
+    assert adapter.consume_stored_marker("", "gen-7", root=tmp_path) is False
+    assert adapter.mark_answer_stored("", "gen-7", root=tmp_path) is None
+    payload = _payload("stop", status="completed", loop_count=0, transcript_path=str(transcript))
+    normalized = adapter.normalize_payload(payload, "store-to-session.py", ("--stop",))
+    assert normalized["assistant_message"] == "answer"
+
+
+def test_stored_marker_path_is_sanitized(adapter, tmp_path):
+    path = adapter.mark_answer_stored("../evil/../id", "gen-7", root=tmp_path)
+    assert path is not None
+    assert path.parent == tmp_path / "responses"
+    assert ".." not in path.name and "/" not in path.name
+    assert path.read_text() == "gen-7"
 
 
 def test_stop_falls_back_to_the_transcript_tail(adapter, tmp_path):
@@ -246,27 +293,6 @@ def test_transcript_tail_drops_a_partial_first_line(adapter, tmp_path, monkeypat
     _write_transcript(tmp_path / "t.jsonl", first, last)
     records = adapter.read_transcript_tail(tmp_path / "t.jsonl")
     assert [adapter.last_assistant_text([r]) for r in records] == ["kept"]
-
-
-def test_after_agent_response_caches_per_conversation(adapter):
-    normalized = adapter.normalize_payload(
-        _payload("afterAgentResponse", text="the answer"), adapter.CACHE_RESPONSE
-    )
-    assert normalized["hook_event_name"] == "AfterAgentResponse"
-    assert adapter.run_inner_hook(normalized, adapter.CACHE_RESPONSE) == {}
-    assert adapter.pop_cached_response("conv-123") == "the answer"
-    assert adapter.pop_cached_response("conv-123") == ""
-
-
-def test_cache_response_sanitizes_the_key_and_bounds_the_size(adapter, tmp_path, monkeypatch):
-    monkeypatch.setattr(adapter, "MAX_CACHED_RESPONSE_BYTES", 8)
-    path = adapter.cache_response("../evil/../id", "0123456789abcdef", root=tmp_path)
-    assert path is not None
-    assert path.parent == tmp_path / "responses"
-    assert ".." not in path.name and "/" not in path.name
-    assert adapter.pop_cached_response("../evil/../id", root=tmp_path) == "89abcdef"
-    assert adapter.cache_response("", "text", root=tmp_path) is None
-    assert adapter.cache_response("id", "   ", root=tmp_path) is None
 
 
 def test_pre_compact_and_session_end_carry_their_reason(adapter):
@@ -535,13 +561,57 @@ def test_main_records_every_invocation_in_the_adapter_log(adapter, monkeypatch, 
     assert all(isinstance(r["ms"], int) and "ts" in r and "pid" in r for r in records)
 
 
+def test_main_stores_the_answer_once_per_turn_across_after_response_and_stop(
+    adapter, monkeypatch, capsys, tmp_path
+):
+    """afterAgentResponse stores the QA pair and marks the turn; the same turn's
+    stop is skipped; a stop for a turn nobody stored falls back to the transcript."""
+    calls: list[tuple[str, str]] = []
+
+    def runner(payload, script, flags):
+        calls.append((payload["hook_event_name"], payload.get("assistant_message", "")))
+        return json.dumps({})
+
+    monkeypatch.setattr(adapter, "_run_script", runner)
+    transcript = _write_transcript(
+        tmp_path / "t.jsonl", _user("q"), _assistant({"type": "text", "text": "scraped"})
+    )
+
+    after = _payload("afterAgentResponse", text="the answer", transcript_path=str(transcript))
+    monkeypatch.setattr("sys.stdin", _Stdin(json.dumps(after)))
+    assert adapter.main(["store-to-session.py", "--stop"]) == 0
+    assert json.loads(capsys.readouterr().out.strip()) == {}  # nothing leaks to Cursor
+
+    stop = _payload("stop", status="completed", loop_count=0, transcript_path=str(transcript))
+    monkeypatch.setattr("sys.stdin", _Stdin(json.dumps(stop)))
+    assert adapter.main(["store-to-session.py", "--stop"]) == 0
+    capsys.readouterr()
+
+    later = dict(stop, generation_id="gen-8")
+    monkeypatch.setattr("sys.stdin", _Stdin(json.dumps(later)))
+    assert adapter.main(["store-to-session.py", "--stop"]) == 0
+    capsys.readouterr()
+
+    assert calls == [("Stop", "the answer"), ("Stop", "scraped")]
+    log = adapter.state_dir() / adapter.ADAPTER_LOG_NAME
+    records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert [(r["cursor_event"], r["outcome"]) for r in records] == [
+        ("afterAgentResponse", "ran"),
+        ("stop", "skipped"),
+        ("stop", "ran"),
+    ]
+    assert records[1]["skip_reason"] == "answer_already_stored"
+    assert not list((adapter.state_dir() / "responses").glob("*.stored"))
+
+
 def test_hook_table_only_names_known_scripts_with_bounded_timeouts(adapter):
     for event, entries in adapter.HOOK_TABLE.items():
         assert event in adapter.EVENT_MAP, event
         for script, flags, timeout in entries:
             assert script in adapter.EVENT_FOR_SCRIPT, script
             assert all(flag.startswith("--") for flag in flags)
-            if script != adapter.CACHE_RESPONSE:
-                assert adapter.SCRIPT_TIMEOUT_SECONDS[script] < timeout, (
-                    f"{script}: the adapter must time out before Cursor does"
-                )
+            assert adapter.SCRIPT_TIMEOUT_SECONDS[script] < timeout, (
+                f"{script}: the adapter must time out before Cursor does"
+            )
+    assert adapter.HOOK_TABLE["afterAgentResponse"] == [("store-to-session.py", ("--stop",), 120)]
+    assert ("store-to-session.py", ("--stop",), 120) in adapter.HOOK_TABLE["stop"]

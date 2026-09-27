@@ -32,8 +32,8 @@ Cursor spawns one process per hook, writes a JSON payload to stdin and reads a J
 | `sessionStart` | `session-start.py` | boots/checks the Cognee server, registers the conversation, returns `additional_context` |
 | `beforeSubmitPrompt` | `session-context-lookup.py`, `store-user-prompt.py` | one recall request; the memory block is returned as `additional_context` (and in the Claude-style `hookSpecificOutput.additionalContext` Cursor also accepts); the prompt is parked for the answer |
 | `postToolUse`, `postToolUseFailure` | `store-to-session.py` | tool call + result stored as a trace entry (`Shell`→`Bash`, `Task`→`Agent`, `MCP:x`→`mcp__x`) |
-| `afterAgentResponse` | *(adapter only)* | the assistant text is cached per conversation — Cursor's `stop` payload carries none |
-| `stop` | `store-to-session.py --stop`, `credits-refresh.py` | prompt + final answer stored as a QA pair; the answer comes from the `afterAgentResponse` cache, else from the tail of Cursor's JSONL transcript |
+| `afterAgentResponse` | `store-to-session.py --stop` | prompt + final answer stored as one QA pair — this is the end-of-turn hook the Cursor IDE actually fires, and its `text` is the answer |
+| `stop` | `store-to-session.py --stop`, `credits-refresh.py` | fallback only: skipped when `afterAgentResponse` already stored the turn (a per-conversation marker under `responses/`); otherwise the answer is scraped from the tail of Cursor's JSONL transcript. Never observed to fire in IDE 3.16.17 / CLI 2026.09.26 |
 | `preCompact` | `pre-compact.py` | memory anchor / deferred sync |
 | `sessionEnd` | `sync-session-to-graph.py --session-end` | session memory bridged into the graph |
 
@@ -119,7 +119,7 @@ tail -n 20 ~/.cognee-plugin/cursor/hook.log
 python3 ~/.cursor/plugins/local/cognee-memory/scripts/doctor.py --json   # or the checkout path
 ```
 
-`hook.log` shows `store.session_key` with `"source": "payload.session_id"` for each hook, `trace.stored` after tool calls and `stop.stored` after an answer. Cursor's own **Hooks** output channel (Cmd+Shift+P → *Hooks*) shows every hook launch and any error. The next prompt's context begins with the `Cognee memory: … memory hits …` header.
+`hook.log` shows `store.session_key` with `"source": "payload.session_id"` for each hook, `trace.stored` after tool calls and `stop.stored` after an answer. `~/.cognee-plugin/cursor/adapter.log` has one line per hook Cursor actually launched — Cursor event, inner script, conversation/turn, `outcome` `ran` / `skipped` / `failed` and duration — which is the place to look when a stage seems missing (the inner scripts log nothing when the adapter skips them). Cursor's own **Hooks** output channel (Cmd+Shift+P → *Hooks*) shows every hook launch and any error. The next prompt's context begins with the `Cognee memory: … memory hits …` header.
 
 ## Status line (Cursor CLI)
 
@@ -141,7 +141,8 @@ The Cursor IDE has no status line. There, the same text (without ANSI) is the fi
 - **No user-facing notices in the IDE.** Cursor has no channel for a non-blocking hook message. Notices the other plugins show as a `systemMessage` (memory off, update available) are appended to the model's context as `[cognee notice] …` so the agent can relay them; in the CLI the status line shows the same states.
 - **`preCompact` cannot inject context** in Cursor, so the memory anchor the Claude Code plugin injects before compaction is not available; the hook still defers the sync.
 - **Headless CLI runs (`cursor-agent -p …`) fire only `sessionStart`, `postToolUse`/`postToolUseFailure` and `sessionEnd`** (observed with CLI 2026.09.26). The prompt passed on the command line does not go through `beforeSubmitPrompt`, and `afterAgentResponse`/`stop` do not fire, so headless runs store tool traces (which later recall finds) but not the prompt or the answer, and get no recall injected. Interactive sessions get the full lifecycle.
-- **Cloud agents** run project hooks only: `sessionStart`/`sessionEnd` do not fire there, so recall starts on the first prompt and the graph sync relies on the idle watcher and the `stop` path.
+- **Cursor's `stop` hook has not been seen to fire** (IDE 3.16.17, CLI 2026.09.26; `~/.cognee-plugin/cursor/adapter.log` records every hook launch). That is why the QA pair is stored from `afterAgentResponse`; `credits-refresh.py`, registered on `stop`, therefore rarely runs and the credits segment of the status line may lag.
+- **Cloud agents** run project hooks only: `sessionStart`/`sessionEnd` do not fire there, so recall starts on the first prompt and the graph sync relies on the idle watcher.
 - **Cursor's Claude Code compatibility layer** can load the *Claude Code* Cognee plugin's hooks too (Settings → Agents → Third-Party Imports). Running both against the same conversation captures everything twice; pick one.
 
 ## Development

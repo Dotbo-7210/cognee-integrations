@@ -13,9 +13,11 @@ This module is the boundary between the two:
 
 * ``normalize_payload`` maps Cursor's fields (``conversation_id``,
   ``generation_id``, ``workspace_roots``, ``tool_output``, ``Shell`` ...) onto the
-  Cognee contract. Cursor's ``stop`` carries no assistant text, so the final
-  answer is taken from the ``afterAgentResponse`` hook (cached per conversation)
-  or, failing that, from the tail of Cursor's JSONL transcript.
+  Cognee contract. The prompt/answer pair is stored from ``afterAgentResponse``
+  (the one Cursor hook that reliably fires at the end of a turn and carries the
+  answer ``text``); it runs the inner ``Stop`` hook. Cursor's own ``stop`` is a
+  fallback only: it skips when the turn was already stored and otherwise takes
+  the answer from the tail of Cursor's JSONL transcript.
 * ``run_inner_hook`` launches the inner script through ``hook_runner.py`` (so a
   crash is reported to ``hook-crash.log`` instead of vanishing) with a bounded
   timeout and a kill of the whole process tree on expiry.
@@ -43,7 +45,6 @@ from typing import Any, BinaryIO, Callable
 
 MAX_TRANSCRIPT_TAIL_BYTES = 1_048_576
 MAX_INNER_OUTPUT_BYTES = 1_048_576
-MAX_CACHED_RESPONSE_BYTES = 262_144
 PROCESS_CLEANUP_SECONDS = 2.0
 
 #: Cursor hook event -> the Claude Code event name the inner scripts understand.
@@ -66,9 +67,6 @@ TOOL_NAME_MAP = {
     "Task": "Agent",
 }
 
-#: The adapter-internal command that caches ``afterAgentResponse`` text.
-CACHE_RESPONSE = "cache-response"
-
 #: Inner script -> the Claude Code event it expects when no event is given.
 EVENT_FOR_SCRIPT = {
     "session-start.py": "SessionStart",
@@ -78,7 +76,6 @@ EVENT_FOR_SCRIPT = {
     "credits-refresh.py": "Stop",
     "pre-compact.py": "PreCompact",
     "sync-session-to-graph.py": "SessionEnd",
-    CACHE_RESPONSE: "AfterAgentResponse",
 }
 
 #: Seconds each inner script may run. Kept under the hooks.json ``timeout`` so
@@ -104,7 +101,11 @@ HOOK_TABLE: dict[str, list[tuple[str, tuple[str, ...], int]]] = {
     ],
     "postToolUse": [("store-to-session.py", (), 120)],
     "postToolUseFailure": [("store-to-session.py", (), 120)],
-    "afterAgentResponse": [(CACHE_RESPONSE, (), 10)],
+    # The answer is stored here: afterAgentResponse is the end-of-turn hook
+    # Cursor's IDE actually fires (its ``stop`` was never observed to launch,
+    # IDE 3.16.17 / CLI 2026.09.26) and it carries the answer ``text``.
+    "afterAgentResponse": [("store-to-session.py", ("--stop",), 120)],
+    # Fallback only: skipped when afterAgentResponse already stored the turn.
     "stop": [
         ("store-to-session.py", ("--stop",), 120),
         ("credits-refresh.py", (), 10),
@@ -205,13 +206,15 @@ def _parse_json_ish(value: object) -> Any:
 
 def infer_event(payload: dict[str, Any], script: str, flags: tuple[str, ...]) -> str:
     """The Claude Code event for this invocation."""
+    if script == "store-to-session.py" and "--stop" in flags:
+        # The QA store runs from ``afterAgentResponse`` (and ``stop``); either
+        # way the inner script must see Claude Code's ``Stop``.
+        return "Stop"
     native = payload.get("hook_event_name")
     if isinstance(native, str) and native in EVENT_MAP:
         return EVENT_MAP[native]
     if isinstance(native, str) and native in EVENT_MAP.values():
         return native
-    if script == "store-to-session.py" and "--stop" in flags:
-        return "Stop"
     return EVENT_FOR_SCRIPT.get(script, "")
 
 
@@ -272,10 +275,18 @@ def normalize_payload(
         if isinstance(payload.get("status"), str):
             normalized["status"] = payload["status"]
         message = _first_str(payload, "assistant_message", "last_assistant_message", "text")
-        if not message and session:
-            message = pop_cached_response(session)
-        if not message:
-            message = last_assistant_text(read_transcript_tail(normalized.get("transcript_path")))
+        if not message and payload.get("hook_event_name") != "afterAgentResponse":
+            # Cursor's stop carries no text. If afterAgentResponse already
+            # stored this turn, leave the message empty so the hook is skipped
+            # instead of storing the answer twice; otherwise recover it from
+            # the transcript tail. (An afterAgentResponse without text has
+            # nothing to store and is skipped as well.)
+            if consume_stored_marker(session, turn):
+                normalized["answer_already_stored"] = True
+            else:
+                message = last_assistant_text(
+                    read_transcript_tail(normalized.get("transcript_path"))
+                )
         if message:
             normalized["assistant_message"] = message
             normalized["last_assistant_message"] = message
@@ -296,44 +307,50 @@ def normalize_payload(
 
 
 # --------------------------------------------------------------------------- #
-# Final-answer recovery: afterAgentResponse cache, then the transcript tail
+# Stored-turn marker (afterAgentResponse -> stop) and transcript-tail recovery
 # --------------------------------------------------------------------------- #
 
 
-def _response_cache_path(session: str, root: Path | None = None) -> Path:
+def _stored_marker_path(session: str, root: Path | None = None) -> Path:
     key = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(session))
     key = key.strip("_")[:120] or "unknown"
     base = root if root is not None else state_dir()
-    return base / "responses" / f"{key}.txt"
+    return base / "responses" / f"{key}.stored"
 
 
-def cache_response(session: str, text: str, root: Path | None = None) -> Path | None:
-    """Remember the latest assistant message so ``stop`` can store it."""
-    if not session or not isinstance(text, str) or not text.strip():
+def mark_answer_stored(session: str, turn: str, root: Path | None = None) -> Path | None:
+    """Record that ``afterAgentResponse`` stored the QA pair for this turn."""
+    if not session:
         return None
-    path = _response_cache_path(session, root)
+    path = _stored_marker_path(session, root)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        encoded = text.encode("utf-8", errors="replace")[-MAX_CACHED_RESPONSE_BYTES:]
         tmp = path.with_suffix(".tmp")
-        tmp.write_bytes(encoded)
+        tmp.write_text(str(turn or ""), encoding="utf-8")
         os.replace(tmp, path)
         return path
     except OSError:
         return None
 
 
-def pop_cached_response(session: str, root: Path | None = None) -> str:
-    path = _response_cache_path(session, root)
+def consume_stored_marker(session: str, turn: str, root: Path | None = None) -> bool:
+    """True when the marker says this turn's answer is already stored.
+
+    The marker is removed either way: a marker for a *different* turn is stale
+    (that turn's ``stop`` never came) and must not suppress a later one.
+    """
+    if not session:
+        return False
+    path = _stored_marker_path(session, root)
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        stored_turn = path.read_text(encoding="utf-8").strip()
     except OSError:
-        return ""
+        return False
     try:
         path.unlink()
     except OSError:
         pass
-    return text.strip()
+    return not stored_turn or not turn or stored_turn == str(turn)
 
 
 def read_transcript_tail(transcript_path: object) -> list[dict[str, Any]]:
@@ -606,11 +623,15 @@ def run_inner_hook(
     *,
     runner: Runner | None = None,
 ) -> Any:
-    """Run one inner hook, or handle the adapter-internal commands."""
-    if script == CACHE_RESPONSE:
-        cache_response(str(payload.get("session_id") or ""), str(payload.get("text") or ""))
-        return {}
+    """Run one inner hook through ``hook_runner.py`` (or ``runner`` in tests)."""
     return (runner or _run_script)(payload, script, flags)
+
+
+def stores_the_answer(cursor_event: str, script: str, flags: tuple[str, ...]) -> bool:
+    """Is this the ``afterAgentResponse`` QA store whose turn ``stop`` must skip?"""
+    if cursor_event != "afterAgentResponse" or script != "store-to-session.py":
+        return False
+    return "--stop" in flags
 
 
 def should_skip(normalized: dict[str, Any], script: str, flags: tuple[str, ...]) -> bool:
@@ -651,11 +672,15 @@ def main(argv: list[str] | None = None) -> int:
         reply = neutral_reply(event)
         if should_skip(normalized, script, flags):
             record["outcome"] = "skipped"
+            if normalized.get("answer_already_stored"):
+                record["skip_reason"] = "answer_already_stored"
         else:
             output = run_inner_hook(normalized, script, flags)
             reply = translate_output(event, output)
             record["outcome"] = "ran"
             record["reply_keys"] = sorted(reply)
+            if stores_the_answer(record["cursor_event"], script, flags):
+                mark_answer_stored(record["session"], record["turn"])
     except Exception as exc:  # fail open, always
         record["outcome"] = "failed"
         record["error"] = f"{type(exc).__name__}: {exc}"[:200]

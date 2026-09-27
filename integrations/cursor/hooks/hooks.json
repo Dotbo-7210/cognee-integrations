@@ -31,8 +31,8 @@
     ],
     "afterAgentResponse": [
       {
-        "command": "./scripts/run-cursor-hook cache-response",
-        "timeout": 10
+        "command": "./scripts/run-cursor-hook store-to-session.py --stop",
+        "timeout": 120
       }
     ],
     "stop": [
