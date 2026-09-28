@@ -115,11 +115,11 @@ class ChatMemoryAdapter:
         return f"web:{site_id}:docs"
 
     def conversations_dataset(self, site_id: str) -> str:
-        """Where exchanges are stored, and where cognee's session bridge writes.
+        """Where distillation moves conversations into permanent memory.
 
-        Transcripts, the lessons distilled from them, and whatever the session
-        bridge writes alongside: one dataset, so a lesson cannot outlive the
-        conversation it cites and one clear disposes of all of it.
+        cognee's persisted copy of each distilled session and the lessons drawn
+        from it: one dataset, so a lesson cannot outlive the conversation it
+        cites and one clear disposes of all of it.
 
         Deliberately not the docs corpus. ``answer`` names the docs dataset and
         nothing else, so nothing stored here can become the source of a later

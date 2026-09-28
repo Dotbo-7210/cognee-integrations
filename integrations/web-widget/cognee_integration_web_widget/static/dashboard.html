@@ -321,6 +321,15 @@
   .pick-file { display: flex; gap: 7px; align-items: center; font-size: 12px;
                padding: 1px 0 1px 18px }
   .pick-file .muted { font-size: 11px }
+  .sync { font-size: 12px; white-space: nowrap; display: inline-flex; align-items: center; gap: 6px }
+  .sync::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--muted) }
+  .sync.synced { color: var(--ok) } .sync.synced::before { background: var(--ok) }
+  .sync.pending { color: var(--warn) } .sync.pending::before { background: var(--warn) }
+  .turn .sync { margin-bottom: 4px }
+  .sync-divider { display: flex; align-items: center; gap: 10px; margin: 14px 0 6px;
+                  font-size: 12px; color: var(--warn) }
+  .sync-divider::before, .sync-divider::after { content: ""; flex: 1; border-top: 1px dashed var(--warn) }
+  #sess-banner .notice { display: flex; flex-wrap: wrap; gap: 10px; align-items: center }
   .pick-bar { display: flex; gap: 8px; align-items: center; margin-top: 10px; font-size: 12px }
   .pick-count { color: var(--muted) }
 
@@ -404,12 +413,14 @@
 </section>
 
 <section>
-  <div class="sec-head"><h2>Conversations</h2><span class="count" id="sess-count"></span></div>
+  <div class="sec-head"><h2>Conversations</h2><span class="count" id="sess-count"></span><span class="corpus-actions" id="sess-fresh"></span></div>
+  <div id="sess-banner"></div>
   <div class="panel">
     <table id="sessions">
       <thead><tr>
         <th data-sort="visitor">visitor / conversation</th>
         <th data-sort="turns">turns</th>
+        <th>synced to cognee</th>
         <th></th>
       </tr></thead>
       <tbody></tbody>
@@ -1133,6 +1144,15 @@
   function renderCorpusActions() {
     const box = $("#corpus-actions");
     box.textContent = "";
+    const when = document.createElement("span");
+    when.className = "count";
+    const refresh = document.createElement("button");
+    refresh.appendChild(text("Refresh"));
+    refresh.title = "Re-read the open tab from cognee: files, repositories or " +
+      "conversation memory. Repositories read the whole graph, so that one can " +
+      "take a while on a large corpus.";
+    refresh.onclick = () => refreshCorpus(refresh, when);
+    box.append(when, refresh);
     const ingest = document.createElement("button");
     ingest.appendChild(text("Ingest"));
     ingest.title = "Add a folder or a file to the corpus";
@@ -1301,24 +1321,170 @@
   // conversations that carried real traffic showed as empty rows and could not
   // be told apart from ones that never had a turn. A conversation appears here
   // when there is something to read.
+  const SYNC_LABEL = { synced: "synced", pending: "pending" };
+
+  function syncBadge(state, extra) {
+    const b = document.createElement("span");
+    b.className = "sync " + state;
+    b.appendChild(text((SYNC_LABEL[state] || state) + (extra ? " \u00b7 " + extra : "")));
+    return b;
+  }
+
+  // "in 6d 4h", "in 3h 20m", "overdue": until cognee is expected to forget it.
+  function until(iso) {
+    const ms = new Date(iso).getTime() - Date.now();
+    if (!(ms > 0)) return "overdue";
+    const h = Math.floor(ms / 3600000), d = Math.floor(h / 24);
+    if (d) return "in " + d + "d " + (h % 24) + "h";
+    return "in " + h + "h " + Math.floor((ms % 3600000) / 60000) + "m";
+  }
+
+  function syncCell(td, s) {
+    if (s.pending) {
+      // A conversation that was distilled and then continued is pending again,
+      // for its new turns only - say both halves.
+      td.appendChild(syncBadge("pending", s.synced
+        ? s.pending + " new \u00b7 " + s.synced + " synced"
+        : s.pending + " of " + s.turns.length));
+      if (s.expires_at) {
+        const when = document.createElement("div");
+        when.className = "muted";
+        when.appendChild(text("forgotten " + until(s.expires_at) + " unless distilled"));
+        when.title = "Estimated: cognee keeps a session about 7 days after its last " +
+          "activity. The tenant does not report its actual setting.";
+        td.appendChild(when);
+      }
+    } else {
+      td.appendChild(syncBadge("synced", s.synced_at ? ago(s.synced_at) : ""));
+    }
+    if (s.last_failure) {
+      const f = document.createElement("div");
+      f.className = "muted";
+      f.appendChild(text("last distillation failed: " + s.last_failure));
+      td.appendChild(f);
+    }
+  }
+
+  // The nudge to distil. Pending turns exist only in cognee's session memory,
+  // which expires; distilling is what moves them into permanent memory.
+  function renderSessionBanner(c) {
+    const box = $("#sess-banner");
+    box.textContent = "";
+    const p = c.pending || {};
+    if (!p.turns && c.sync_state_persisted !== false) return;
+    const note = document.createElement("div");
+    note.className = "notice";
+    if (p.turns) {
+      const msg = document.createElement("span");
+      msg.appendChild(text(
+        p.conversations + (p.conversations === 1 ? " conversation has " : " conversations have ") +
+        p.turns + (p.turns === 1 ? " turn" : " turns") + " not synced into cognee. " +
+        "Run Distil to sync them and learn from them." +
+        (p.soonest_expiry ? " The first is forgotten " + until(p.soonest_expiry) + "." : "")));
+      const btn = document.createElement("button");
+      btn.appendChild(text("Distil now"));
+      const status = document.createElement("span");
+      status.className = "muted";
+      btn.onclick = () => startDistil(btn, status);
+      note.append(msg, btn, status);
+    }
+    if (c.sync_state_persisted === false) {
+      const warn = document.createElement("span");
+      warn.className = "muted";
+      warn.appendChild(text(
+        "Sync status is kept in memory only (WIDGET_SYNC_STATE_PATH is unset): " +
+        "a restart shows every conversation as pending again."));
+      note.appendChild(warn);
+    }
+    box.appendChild(note);
+  }
+
+  // Start fresh: cognee cannot delete a session, so the backend is told to
+  // ignore every one that began before now. Confirmed in place, and undoable.
+  function renderStartFresh(c) {
+    const box = $("#sess-fresh");
+    box.textContent = "";
+    const status = document.createElement("span");
+    status.className = "count";
+    const call = async (method) => {
+      box.querySelectorAll("button").forEach((b) => (b.disabled = true));
+      try {
+        const r = await fetch(api("/api/dashboard/conversations/start-fresh"), { method });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        await reloadConversations();
+      } catch (e) {
+        status.textContent = "could not update: " + e.message;
+        box.querySelectorAll("button").forEach((b) => (b.disabled = false));
+      }
+    };
+    if (c.baseline) {
+      status.textContent = "only conversations started after " +
+        new Date(c.baseline).toLocaleString() + " \u00b7";
+      const undo = document.createElement("button");
+      undo.appendChild(text("Show earlier conversations"));
+      undo.onclick = () => call("DELETE");
+      box.append(status, undo);
+      return;
+    }
+    const fresh = document.createElement("button");
+    fresh.appendChild(text("Start fresh"));
+    fresh.title = "Ignore every conversation that exists now: hidden here, never " +
+      "pending, never distilled. cognee cannot delete sessions, so this is the clean slate.";
+    fresh.onclick = () => {
+      box.textContent = "";
+      const ask = document.createElement("span");
+      ask.className = "count";
+      ask.appendChild(text("Ignore all " + (c.conversations || []).length +
+        " existing conversation(s)? Only new ones will be shown and distilled."));
+      const yes = document.createElement("button");
+      yes.className = "danger";
+      yes.appendChild(text("Start fresh"));
+      yes.onclick = () => call("POST");
+      const no = document.createElement("button");
+      no.appendChild(text("Cancel"));
+      no.onclick = () => renderStartFresh(c);
+      box.append(ask, yes, no, status);
+    };
+    box.append(status, fresh);
+  }
+
+  function applyConversations(c) {
+    renderStartFresh(c);
+    sessions = c.conversations || [];
+    $("#sess-count").textContent = sessions.length +
+      (sessions.length === 1 ? " conversation" : " conversations") + " stored";
+    renderSessions(sessions);
+    renderSessionBanner(c);
+  }
+
+  async function reloadConversations() {
+    try {
+      const r = await fetch(api("/api/dashboard/conversations"));
+      if (r.ok) applyConversations(await r.json());
+    } catch (e) {
+      /* the next page load will show it */
+    }
+  }
+
   function renderSessions(list) {
     const body = $("#sessions tbody");
     body.textContent = "";
     if (!list.length) {
       const tr = body.insertRow();
       const td = tr.insertCell();
-      td.colSpan = 3;
+      td.colSpan = 4;
       td.className = "empty";
       td.appendChild(text(
-        "No conversations stored yet. A conversation is written to " +
-        "web:demo:conversations once a visitor who opted in has asked something, " +
-        "and appears here when it has."));
+        "No conversations yet. A conversation appears here once a visitor who " +
+        "opted in has asked something; cognee keeps it in session memory until " +
+        "it is distilled."));
       return;
     }
     list.forEach((s) => {
       const tr = body.insertRow();
       cell(tr, s.visitor, s.session_id);
       cell(tr, s.turns.length + (s.turns.length === 1 ? " turn" : " turns")).className = "num";
+      syncCell(tr.insertCell(), s);
       const actions = tr.insertCell();
       actions.className = "act";
       const btn = document.createElement("button");
@@ -1330,9 +1496,15 @@
         if (open) { open.remove(); open = null; btn.textContent = "View"; return; }
         open = body.insertRow(tr.rowIndex);
         const td = open.insertCell();
-        td.colSpan = 3;
+        td.colSpan = 4;
         td.className = "transcript";
-        s.turns.forEach((t) => {
+        s.turns.forEach((t, i) => {
+          if (i && t.sync === "pending" && s.turns[i - 1].sync === "synced") {
+            const divider = document.createElement("div");
+            divider.className = "sync-divider";
+            divider.appendChild(text("new since the last distillation \u2014 not synced yet"));
+            td.appendChild(divider);
+          }
           const wrap = document.createElement("div");
           wrap.className = "turn";
           const qRole = document.createElement("div");
@@ -1344,6 +1516,7 @@
           const aRole = document.createElement("div");
           aRole.className = "role";
           aRole.appendChild(text("widget"));
+          wrap.appendChild(syncBadge(t.sync, t.at ? ago(t.at) : ""));
           const a = document.createElement("div");
           a.className = "a";
           a.appendChild(text(t.answer));
@@ -1838,10 +2011,9 @@
       const p = document.createElement("p");
       p.className = "repo-empty";
       p.appendChild(text(
-        "Nothing stored yet. The dataset is created by the first exchange a " +
-        "visitor opts into, and cognee's bridge fills it from there \u2014 the " +
-        "conversation turns it lifted out of the session cache, and the lessons " +
-        "it distilled from them."));
+        "Nothing in permanent memory yet. The dataset is created by the first " +
+        "distillation, which moves conversations out of cognee's session memory " +
+        "into it, together with the lessons it distilled from them."));
       panel.appendChild(p);
       box.appendChild(panel);
       memoryCount = 0;
@@ -1852,22 +2024,17 @@
     memoryCount = d.item_count || 0;
     const stats = document.createElement("div");
     stats.className = "stats";
-    stat(stats, String(d.counts.sessions), "transcripts",
-         "One per conversation, written as each answer goes out. " +
-         "Their turns are listed under Conversations.");
+    stat(stats, String(d.counts.sessions), "conversations saved",
+         "Conversations moved into permanent memory by a distillation, one per " +
+         "session. Conversations not distilled yet are under Conversations, as pending.");
     // The reason the dataset exists: what the conversations taught.
     stat(stats, String(d.counts.lessons), "lessons distilled",
          "Written when you run Distil conversations below, so a new conversation has none yet.");
     stat(stats, String(d.item_count), "documents",
-         "Everything in the dataset: transcripts, lessons, and cognee's own copies");
-    if (d.counts.bridged_documents) {
-      stat(stats, String(d.counts.bridged_documents), "cognee copies",
-           "cognee's session bridge persists the same conversations again. " +
-           "Counted apart: they hold the same turns minus any its watermark skipped.");
-    }
+         "Everything in the dataset: saved conversations and lessons");
     panel.appendChild(stats);
 
-    [["Lessons", d.lessons], ["Transcripts", d.sessions]].forEach(([title, rows]) => {
+    [["Lessons", d.lessons], ["Saved conversations", d.sessions]].forEach(([title, rows]) => {
       if (!rows || !rows.length) return;
       const fold = document.createElement("details");
       fold.className = "pick-group";
@@ -1902,7 +2069,8 @@
     clear.className = "pick-bar";
     const distil = document.createElement("button");
     distil.appendChild(text("Distil conversations"));
-    distil.title = "Ask cognee to distil lessons from each saved transcript. " +
+    distil.title = "Ask cognee to save each pending conversation into permanent " +
+      "memory and distil lessons from it. " +
       "Ones already distilled are skipped at no cost.";
     const distilStatus = document.createElement("span");
     distilStatus.className = "muted";
@@ -1932,12 +2100,7 @@
       const body = await r.json();
       if (!r.ok) throw new Error(body.detail || "HTTP " + r.status);
       if (!body.sessions) {
-        status.textContent = body.exists === false
-          ? "No conversations dataset yet."
-          : body.expired
-            ? "No saved conversation can be distilled: all " + body.expired +
-              " have lost their cognee session."
-            : "No saved conversations to distil.";
+        status.textContent = "Nothing pending: every conversation is already synced.";
         btn.disabled = false;
         return;
       }
@@ -1952,7 +2115,9 @@
   // Polls while a run is going. cognee reports no per-stage result, so what is
   // shown is how each session's request went; the lessons themselves appear in
   // the count above a few minutes later, once their cognify finishes.
-  async function showDistil(btn, status) {
+  // watching: this call is a poll of a run it saw running, so a finished run
+  // here is one that just finished - the moment the sync badges change.
+  async function showDistil(btn, status, watching) {
     let d;
     try {
       d = await fetch(api("/api/dashboard/distil")).then((r) => r.json());
@@ -1965,17 +2130,17 @@
     const parts = [done + " of " + d.sessions + " conversations done"];
     if (o.busy) parts.push(o.busy + " busy");
     if (o.failed) parts.push(o.failed + " failed");
-    if (d.expired) parts.push(d.expired + " skipped, session expired");
     if (d.running) {
       btn.disabled = true;
       status.textContent = "Distilling: " + parts.join(", ") +
         " \u2014 each takes a few minutes\u2026";
-      if (btn.isConnected) setTimeout(() => showDistil(btn, status), 5000);
+      if (btn.isConnected) setTimeout(() => showDistil(btn, status, true), 5000);
     } else {
       btn.disabled = false;
       status.textContent = "Last run: " + parts.join(", ") +
         (d.finished_at ? " \u00b7 finished " + ago(d.finished_at) : "") +
         ". New lessons show up above once cognee finishes building them.";
+      if (watching) reloadConversations();
     }
   }
 
@@ -1985,8 +2150,8 @@
     const warn = document.createElement("p");
     warn.className = "notice";
     warn.appendChild(text(
-      "Deleting \u201c" + name + "\u201d removes every transcript and every lesson " +
-      "distilled from them \u2014 they share this dataset, so one clear disposes of " +
+      "Deleting \u201c" + name + "\u201d removes every saved conversation and every " +
+      "lesson distilled from them \u2014 they share this dataset, so one clear disposes of " +
       "both and no lesson is left citing a conversation that no longer exists. Unlike " +
       "the docs corpus this cannot be rebuilt by ingesting a folder again: it is what " +
       "visitors said. It also invalidates the sessions attributed to it."));
@@ -2037,47 +2202,92 @@
   function prefetchComposition(force) {
     if (compositionStarted && !force) return;
     compositionStarted = true;
-    const state = () => $("#graph-state");
-    const go = async () => {
-      if (state()) state().textContent = "loading breakdown\u2026";
-      try {
-        const g = await fetch(api("/api/dashboard/graph")).then((r) => {
-          if (!r.ok) throw new Error("HTTP " + r.status);
-          return r.json();
-        });
-        renderComposition(g);
-        renderRepositories(g.repositories || []);
-        const sum = $("#graph-summary");
-        sum.textContent = "";
-        [[g.node_total, "nodes"], [g.edge_total, "edges"]].forEach(([n, label]) => {
-          const v = document.createElement("span");
-          v.className = "sum-n";
-          v.appendChild(text((n || 0).toLocaleString()));
-          const l = document.createElement("span");
-          l.className = "sum-l";
-          l.appendChild(text(label));
-          sum.append(v, l);
-        });
-        // Counted now, but cognee may not have finished rebuilding after a
-        // change, so a fresh count is not the same as a settled one.
-        const settling = corpusChangedAt && Date.now() - corpusChangedAt < 10 * 60 * 1000;
-        $("#graph-when").textContent = settling
-          ? "counted just now — cognee may still be building after the change"
-          : "counted just now";
-      } catch (e) {
-        // Quiet on purpose: this was never requested, so a failure gets a line
-        // inside the fold rather than a toast over the page.
-        if (state()) state().textContent = "breakdown unavailable";
-        const charts = $("#graph-charts");
-        charts.textContent = "";
-        const p = document.createElement("p");
-        p.className = "chart-note";
-        p.appendChild(text("Could not read the graph (" + e.message + ")."));
-        charts.appendChild(p);
-      }
-    };
+    const go = () => loadComposition(false);
     if (window.requestIdleCallback) requestIdleCallback(go, { timeout: 2500 });
     else setTimeout(go, 400);
+  }
+
+  // fresh: skip the backend's fifteen-minute graph cache, which is what the
+  // Refresh button is for - mid-ingest, that cache is exactly what hides the
+  // progress. Resolves either way; a failure is reported inside the fold.
+  async function loadComposition(fresh) {
+    const state = () => $("#graph-state");
+    if (state()) state().textContent = "loading breakdown\u2026";
+    try {
+      const g = await fetch(api("/api/dashboard/graph" + (fresh ? "?fresh=1" : ""))).then((r) => {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      });
+      renderComposition(g);
+      renderRepositories(g.repositories || []);
+      const sum = $("#graph-summary");
+      sum.textContent = "";
+      [[g.node_total, "nodes"], [g.edge_total, "edges"]].forEach(([n, label]) => {
+        const v = document.createElement("span");
+        v.className = "sum-n";
+        v.appendChild(text((n || 0).toLocaleString()));
+        const l = document.createElement("span");
+        l.className = "sum-l";
+        l.appendChild(text(label));
+        sum.append(v, l);
+      });
+      // Counted now, but cognee may not have finished rebuilding after a
+      // change, so a fresh count is not the same as a settled one.
+      const settling = corpusChangedAt && Date.now() - corpusChangedAt < 10 * 60 * 1000;
+      $("#graph-when").textContent = settling
+        ? "counted just now — cognee may still be building after the change"
+        : "counted just now";
+    } catch (e) {
+      // Quiet on purpose: this was never requested, so a failure gets a line
+      // inside the fold rather than a toast over the page.
+      if (state()) state().textContent = "breakdown unavailable";
+      const charts = $("#graph-charts");
+      charts.textContent = "";
+      const p = document.createElement("p");
+      p.className = "chart-note";
+      p.appendChild(text("Could not read the graph (" + e.message + ")."));
+      charts.appendChild(p);
+    }
+  }
+
+  // Re-reads the corpus tab that is open - files in the docs dataset, indexed
+  // repositories, or conversation memory - without reloading the page. An
+  // ingest carries on in cognee long after the upload finishes, and this is how
+  // far along it has got. Only the open tab: the repository count reads the
+  // whole graph, which nobody looking at files should have to wait for.
+  let refreshing = false;
+  async function refreshCorpus(btn, when) {
+    if (refreshing) return;
+    refreshing = true;
+    btn.disabled = true;
+    when.textContent = "refreshing\u2026";
+    const tab = corpusTab;
+    let ok = true;
+    if (tab === "files") {
+      try {
+        const r = await fetch(api("/api/dashboard"));
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        corpus = (await r.json()).corpus;
+        $("#corpus-count").textContent = corpus.item_count + " items in " + corpus.dataset;
+        renderSyncPill(corpus.sync);
+        renderSources(sortBy(corpus.items, "updated", "desc"));
+        renderCorpusTabs();
+      } catch (e) {
+        ok = false;
+      }
+    } else if (tab === "repos") {
+      // Comes with the graph breakdown: the whole graph, so tens of seconds on
+      // a large corpus. Failures are reported inside the graph fold.
+      showReposLoading();
+      await loadComposition(true);
+    } else {
+      memoryKnown = false;
+      await loadConversationMemory();
+    }
+    refreshing = false;
+    btn.disabled = false;
+    const at = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    when.textContent = ok ? "refreshed " + at : "could not refresh \u00b7 " + at;
   }
 
   async function load() {
@@ -2193,10 +2403,7 @@
       act.append(b, vizStatus);
     });
 
-    sessions = s.conversations || [];
-    $("#sess-count").textContent = sessions.length +
-      (sessions.length === 1 ? " conversation" : " conversations") + " stored";
-    renderSessions(sessions);
+    applyConversations(s);
 
     // Analytics last, and never awaited. It is the most expensive thing on the
     // page - one round trip per conversation in the window - and nothing else

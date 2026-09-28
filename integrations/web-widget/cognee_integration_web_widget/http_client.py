@@ -323,29 +323,22 @@ class CogneeHttpClient:
             detail = response.text[:300]
         return False, detail or f"cognee answered {response.status_code}"
 
-    async def update_document(
-        self, *, data_id: str, dataset_id: str, text: str, filename: str
-    ) -> bool:
-        """Replace a stored document with a new version of itself.
+    async def ensure_dataset(self, name: str) -> Optional[str]:
+        """The id of dataset ``name``, creating it if it does not exist.
 
-        ``chunk_level_diff`` is what makes this worth doing over delete-and-add:
-        cognee diffs the new text against the stored one and re-ingests only the
-        chunks the edit touched, so appending a turn to a transcript leaves
-        every earlier chunk - and the ids, entities and summaries hanging off it
-        - exactly where it was.
+        cognee's create returns the existing dataset for a name already taken,
+        so this is safe to call every time. ``None`` if cognee refused.
         """
-        response = await self._request(
-            "PATCH",
-            "/api/v1/update",
-            params={
-                "data_id": data_id,
-                "dataset_id": dataset_id,
-                "chunk_level_diff": "true",
-            },
-            files={"data": (filename, text.encode("utf-8"), "text/plain")},
-            timeout_override=120.0,
-        )
-        return response.status_code < 400
+        # The trailing slash matters: without it cognee answers 307 with an
+        # empty body, and this client does not follow redirects.
+        response = await self._request("POST", "/api/v1/datasets/", json={"name": name})
+        if not 200 <= response.status_code < 300:
+            return None
+        try:
+            data = response.json()
+        except ValueError:
+            return None
+        return str(data.get("id")) if isinstance(data, dict) and data.get("id") else None
 
     async def dataset_progress(self, dataset_id: str, pipeline: str = "cognify_pipeline") -> dict:
         """How far cognee has got building the graph for ``dataset_id``.
@@ -406,11 +399,15 @@ class CogneeHttpClient:
         items = data.get("sessions", data.get("results", data)) if isinstance(data, dict) else data
         return list(items) if isinstance(items, list) else []
 
-    async def improve_session(self, session_id: str, *, dataset_id: str) -> str:
+    async def improve_session(self, session_id: str, *, dataset_id: str) -> tuple[str, str]:
         """Run cognee's improve over one session, distillation included.
 
-        Returns ``"started"``, ``"busy"`` when another improve of this session
-        holds its lock (cognee answers ``{}`` and skips), or ``"failed"``.
+        Returns ``(outcome, status)``. ``outcome`` is ``"started"``, ``"busy"``
+        when another improve of this session holds its lock (cognee answers
+        ``{}`` and skips), or ``"failed"``. ``status`` is the pipeline status
+        cognee reported for the run, when it reported one - the only account of
+        how the run went, because cognee Cloud returns a pipeline run rather
+        than per-stage results.
 
         Distillation runs inside the request even with ``run_in_background``,
         which only detaches the cognify that follows it, so this can take
@@ -428,9 +425,17 @@ class CogneeHttpClient:
             timeout_override=420.0,
         )
         if response.status_code >= 400:
-            return "failed"
+            return "failed", f"HTTP {response.status_code}"
         data = response.json()
-        return "busy" if isinstance(data, dict) and not data else "started"
+        if isinstance(data, dict) and not data:
+            return "busy", ""
+        # {"<dataset id>": {"status": "PipelineRunCompleted", ...}} on cognee
+        # Cloud; the documented ImproveResult carries a status too.
+        status = ""
+        if isinstance(data, dict):
+            run = data.get(dataset_id) if isinstance(data.get(dataset_id), dict) else data
+            status = str(run.get("status") or "")
+        return "started", status
 
     async def session_detail(self, session_id: str) -> dict:
         """One session, including its ``qas`` — both sides of each exchange."""

@@ -212,51 +212,17 @@ def test_chat_forget_command_is_not_answered(web_client):
     assert fake.recall.await_count == before
 
 
-def test_chat_writes_the_turn_into_the_conversation_transcript(web_client):
-    """One document per conversation, named by its session id. We write it
-    rather than letting the bridge persist from the cache, which dropped a turn
-    and then advanced its watermark past it."""
+def test_chat_stores_nothing_of_its_own(web_client):
+    """With a session id, cognee's session-aware recall keeps the turn in the
+    conversation's session itself. The backend used to write a transcript as
+    well, which only duplicated it."""
     client, fake_client = web_client
-    fake_client.list_datasets = AsyncMock(return_value=[])
     fake_client.remember = AsyncMock(return_value=None)
 
     client.post("/api/chat", json={"message": "what is cognee?", "conversation_id": "c1"})
 
-    calls = fake_client.remember.await_args_list
-    assert len(calls) == 1, "a turn writes the transcript and nothing else"
-    transcript = calls[0]
-    assert transcript.kwargs["dataset_name"] == "web:demo:conversations"
-    assert transcript.kwargs["filename"] == "web:demo:anonymous:c1"
-    # No session id: answering must not wake the bridge. Distillation happens
-    # once, when the visitor leaves.
-    assert transcript.kwargs.get("session_id") is None
-    assert "Q: what is cognee?" in transcript.args[0]
-
-
-def test_chat_appends_to_an_existing_transcript_rather_than_replacing_it(web_client):
-    """The second turn patches the document, so cognee re-ingests only the
-    chunks the new turn touched and earlier ones keep their ids."""
-    client, fake_client = web_client
-    fake_client.list_datasets = AsyncMock(
-        return_value=[{"name": "web:demo:conversations", "id": "d2"}]
-    )
-    fake_client.dataset_data = AsyncMock(
-        return_value=[{"name": "web:demo:anonymous:c1", "id": "doc-1"}]
-    )
-    fake_client.fetch_raw = AsyncMock(
-        return_value=b"Conversation web:demo:anonymous:c1\n\nQ: first?\n\nA: one.\n"
-    )
-    fake_client.update_document = AsyncMock(return_value=True)
-    fake_client.remember = AsyncMock(return_value=None)
-
-    client.post("/api/chat", json={"message": "second?", "conversation_id": "c1"})
-
-    # Patched, not rewritten, and nothing else written.
+    assert fake_client.recall.await_args.kwargs["session_id"] == "web:demo:anonymous:c1"
     fake_client.remember.assert_not_awaited()
-    sent = fake_client.update_document.await_args.kwargs
-    assert sent["data_id"] == "doc-1"
-    assert "Q: first?" in sent["text"]  # the earlier turn survives
-    assert "Q: second?" in sent["text"]
 
 
 def test_chat_stores_nothing_when_the_visitor_opted_out(web_client):
@@ -922,6 +888,45 @@ def test_analytics_keeps_a_conversation_with_no_timestamp(analytics_client):
     assert body["totals"]["conversations"] == 3
 
 
+def test_analytics_ignores_sessions_whose_turns_are_gone(analytics_client, fake_client):
+    """cognee keeps listing a session after its turns are deleted, token totals
+    and all. Counting those put over a million tokens next to one real
+    conversation; only what the Conversations section shows counts."""
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    fake_client.list_sessions = AsyncMock(
+        return_value=[
+            {
+                "session_id": "web:demo:visitor-a:conv-1",
+                "last_activity_at": f"{today}T12:00:00+00:00",
+                "tokens_in": 100,
+                "tokens_out": 10,
+            },
+            {
+                "session_id": "web:demo:visitor-b:wiped",
+                "last_activity_at": f"{today}T12:00:00+00:00",
+                "tokens_in": 339775,
+                "tokens_out": 10009,
+            },
+        ]
+    )
+    details = {
+        "web:demo:visitor-a:conv-1": {
+            "qas": [{"question": "q?", "answer": "a.", "time": f"{today}T10:00:00+00:00"}]
+        },
+        "web:demo:visitor-b:wiped": {"qas": []},
+    }
+    fake_client.session_detail = AsyncMock(side_effect=lambda sid: details[sid])
+
+    client, _ = analytics_client
+    totals = client.get("/api/dashboard/analytics?token=s3cret").json()["totals"]
+
+    assert totals["conversations"] == 1
+    assert totals["visitors"] == 1
+    assert (totals["tokens_in"], totals["tokens_out"]) == (100, 10)
+
+
 def test_analytics_defaults_to_one_week(analytics_client):
     """The default window is a week - the range a reader reaches for first."""
     client, _ = analytics_client
@@ -1559,6 +1564,33 @@ def test_repo_ingest_sends_the_url_and_tags_the_code_graph(dashboard_client, fak
     assert "node_set" not in call.kwargs
 
 
+def test_ensure_dataset_posts_to_the_slashed_path():
+    """Without the trailing slash cognee answers 307 with an empty body; this
+    client does not follow redirects, so Distil failed with a JSON error."""
+    import httpx
+    from cognee_integration_web_widget.http_client import CogneeHttpClient
+
+    def handler(request):
+        if request.url.path != "/api/v1/datasets/":
+            return httpx.Response(307, headers={"location": "http://c/api/v1/datasets/"})
+        return httpx.Response(200, json={"id": "d2", "name": "web:demo:conversations"})
+
+    transport = httpx.MockTransport(handler)
+    client = CogneeHttpClient(base_url="http://c", client=httpx.AsyncClient(transport=transport))
+
+    assert asyncio.run(client.ensure_dataset("web:demo:conversations")) == "d2"
+
+
+def test_ensure_dataset_reports_a_non_json_answer_as_a_failure():
+    import httpx
+    from cognee_integration_web_widget.http_client import CogneeHttpClient
+
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, text="Internal"))
+    client = CogneeHttpClient(base_url="http://c", client=httpx.AsyncClient(transport=transport))
+
+    assert asyncio.run(client.ensure_dataset("web:demo:conversations")) is None
+
+
 def test_status_falls_back_when_the_progress_endpoint_is_absent():
     """It 404s on the deployment this was built against, and a 404 swallowed
     into an empty answer made the page wait for numbers never coming."""
@@ -1843,56 +1875,215 @@ def test_deleting_one_source_also_drops_the_cached_render(dashboard_client, fake
     assert server_mod._viz_cache["html"] is None
 
 
-def test_conversations_are_read_from_their_transcripts(dashboard_client, fake_client):
-    """A conversation is one document, so its turns cannot be scattered or
-    partly missing - the two failures of the sources this replaced."""
-    client = dashboard_client
-    fake_client.list_datasets = AsyncMock(
-        return_value=[{"name": "web:demo:conversations", "id": "d2"}]
-    )
-    fake_client.dataset_data = AsyncMock(
+def test_conversations_are_read_from_cognee_sessions(dashboard_client, fake_client):
+    """The widget's sessions, and only those that hold a question: a probe or a
+    session opened and never used is not a conversation."""
+    fake_client.list_sessions = AsyncMock(
         return_value=[
-            {"name": "web:demo:visitor-a:conv-1", "id": "doc-1"},
-            # A distilled lesson lives in this dataset too, and is not a
-            # transcript: only documents named like a session are read.
-            {"name": "text_bc8c18aeac6f2b908c0354290fca9ec5", "id": "doc-2"},
+            {"session_id": "web:demo:visitor-a:conv-1"},
+            {"session_id": "web:demo:anonymous:probe"},
+            {"session_id": "someone-elses-session"},
         ]
     )
-    fake_client.fetch_raw = AsyncMock(
-        return_value=(
-            b"Conversation web:demo:visitor-a:conv-1\n\n"
-            b"Q: install?\n\nA: pip install cognee.\n\n"
-            b"Q: and upgrade?\n\nA: pip install -U cognee.\n"
-        )
-    )
+    details = {
+        "web:demo:visitor-a:conv-1": {
+            "qas": [
+                {
+                    "question": "install?",
+                    "answer": "pip install cognee.",
+                    "time": "2026-09-27T18:17:02",
+                },
+                {
+                    "question": "and upgrade?",
+                    "answer": "pip install -U cognee.",
+                    "time": "2026-09-27T18:18:02",
+                },
+            ]
+        },
+        "web:demo:anonymous:probe": {"qas": []},
+    }
+    fake_client.session_detail = AsyncMock(side_effect=lambda sid: details.get(sid, {}))
 
-    body = client.get("/api/dashboard/conversations?token=s3cret").json()
+    body = dashboard_client.get("/api/dashboard/conversations?token=s3cret").json()
 
-    assert len(body["conversations"]) == 1
+    assert [c["session_id"] for c in body["conversations"]] == ["web:demo:visitor-a:conv-1"]
     conversation = body["conversations"][0]
     assert conversation["visitor"] == "visitor-a"
     assert [t["question"] for t in conversation["turns"]] == ["install?", "and upgrade?"]
     assert conversation["turns"][1]["answer"] == "pip install -U cognee."
-    # One read per transcript, and none for the lesson.
-    assert fake_client.fetch_raw.await_count == 1
+    # Another integration's session is not even read.
+    assert fake_client.session_detail.await_count == 2
+
+
+def _conversation_with_session(fake_client, qas, last_activity="2026-09-27T18:30:00+00:00"):
+    fake_client.list_sessions = AsyncMock(
+        return_value=[
+            {"session_id": "web:demo:visitor-a:conv-1", "last_activity_at": last_activity}
+        ]
+    )
+    fake_client.session_detail = AsyncMock(return_value={"qas": qas})
+
+
+_QAS = [
+    {"question": "first?", "answer": "one.", "time": "2026-09-27T18:17:02+00:00"},
+    {"question": "second?", "answer": "two.", "time": "2026-09-27T18:30:00+00:00"},
+]
+
+
+def test_conversations_are_pending_until_distilled(dashboard_client, fake_client):
+    """Turns live only in session memory, which expires, until a distillation
+    moves them into permanent memory - so each one starts pending, with the
+    time cognee is expected to forget it."""
+    from cognee_integration_web_widget import server as server_mod
+
+    server_mod._sync_state.clear()
+    _conversation_with_session(fake_client, _QAS)
+
+    body = dashboard_client.get("/api/dashboard/conversations?token=s3cret").json()
+
+    conversation = body["conversations"][0]
+    # Every turn, from the session history rather than a possibly short transcript.
+    assert [t["question"] for t in conversation["turns"]] == ["first?", "second?"]
+    assert [t["sync"] for t in conversation["turns"]] == ["pending", "pending"]
+    # Seven days after the last activity.
+    assert conversation["expires_at"] == "2026-10-04T18:30:00+00:00"
+    assert body["pending"] == {
+        "conversations": 1,
+        "turns": 2,
+        "soonest_expiry": "2026-10-04T18:30:00+00:00",
+    }
+
+
+def test_a_finished_distillation_syncs_the_turns_asked_before_it(dashboard_client, fake_client):
+    """A turn asked while the run was going may not be in it, so it stays pending."""
+    from cognee_integration_web_widget import server as server_mod
+
+    server_mod._sync_state.clear()
+    server_mod._record_distillation(
+        "web:demo:visitor-a:conv-1", "2026-09-27T18:20:00+00:00", "started", "PipelineRunCompleted"
+    )
+    _conversation_with_session(fake_client, _QAS)
+
+    conversation = dashboard_client.get("/api/dashboard/conversations?token=s3cret").json()[
+        "conversations"
+    ][0]
+
+    assert [t["sync"] for t in conversation["turns"]] == ["synced", "pending"]
+    assert conversation["pending"] == 1
+
+
+def test_an_errored_distillation_leaves_the_turns_pending(dashboard_client, fake_client):
+    from cognee_integration_web_widget import server as server_mod
+
+    server_mod._sync_state.clear()
+    server_mod._record_distillation(
+        "web:demo:visitor-a:conv-1", "2026-09-27T18:40:00+00:00", "started", "PipelineRunErrored"
+    )
+    _conversation_with_session(fake_client, _QAS)
+
+    conversation = dashboard_client.get("/api/dashboard/conversations?token=s3cret").json()[
+        "conversations"
+    ][0]
+
+    assert [t["sync"] for t in conversation["turns"]] == ["pending", "pending"]
+    assert conversation["last_failure"] == "PipelineRunErrored"
+
+
+def test_distil_runs_only_the_pending_conversations(dashboard_client, fake_client):
+    """And creates the dataset lessons land in: with no transcripts written,
+    nothing else does."""
+    from cognee_integration_web_widget import server as server_mod
+
+    server_mod._sync_state.clear()
+    server_mod._distil_run.clear()
+    server_mod._distil_run["running"] = False
+    server_mod._record_distillation(
+        "web:demo:visitor-b:conv-2", "2026-09-27T19:00:00+00:00", "started", ""
+    )
+    fake_client.list_sessions = AsyncMock(
+        return_value=[
+            {"session_id": "web:demo:visitor-a:conv-1"},
+            {"session_id": "web:demo:visitor-b:conv-2"},
+        ]
+    )
+    fake_client.session_detail = AsyncMock(return_value={"qas": _QAS})
+    fake_client.ensure_dataset = AsyncMock(return_value="d2")
+    fake_client.improve_session = AsyncMock(return_value=("started", "PipelineRunCompleted"))
+
+    body = dashboard_client.post("/api/dashboard/distil?token=s3cret").json()
+
+    assert body["sessions"] == 1
+    fake_client.ensure_dataset.assert_awaited_once_with("web:demo:conversations")
+    improved = [c.args[0] for c in fake_client.improve_session.await_args_list]
+    assert improved == ["web:demo:visitor-a:conv-1"]
+
+
+def test_start_fresh_ignores_sessions_that_began_before_it(dashboard_client, fake_client):
+    """cognee cannot delete a session, so a clean slate means ignoring the old
+    ones: not shown, not pending, not distilled - and undoable."""
+    from cognee_integration_web_widget import server as server_mod
+
+    server_mod._sync_state.clear()
+    fake_client.list_sessions = AsyncMock(
+        return_value=[
+            {"session_id": "web:demo:visitor-a:old", "started_at": "2026-09-27T18:00:00+00:00"},
+            {"session_id": "web:demo:visitor-a:new", "started_at": "2999-01-01T00:00:00+00:00"},
+        ]
+    )
+    fake_client.session_detail = AsyncMock(return_value={"qas": _QAS})
+
+    dashboard_client.post("/api/dashboard/conversations/start-fresh?token=s3cret")
+    body = dashboard_client.get("/api/dashboard/conversations?token=s3cret").json()
+
+    assert body["baseline"]
+    assert [c["session_id"] for c in body["conversations"]] == ["web:demo:visitor-a:new"]
+    # The old session is not even read, let alone offered to Distil.
+    assert [c.args[0] for c in fake_client.session_detail.await_args_list] == [
+        "web:demo:visitor-a:new"
+    ]
+
+    dashboard_client.delete("/api/dashboard/conversations/start-fresh?token=s3cret")
+    body = dashboard_client.get("/api/dashboard/conversations?token=s3cret").json()
+
+    assert body["baseline"] == ""
+    assert len(body["conversations"]) == 2
+
+
+def test_a_busy_session_is_not_marked_synced():
+    """cognee skipped it because another run held its lock: nothing was run."""
+    from cognee_integration_web_widget import server as server_mod
+
+    server_mod._sync_state.clear()
+    server_mod._record_distillation(
+        "web:demo:visitor-a:conv-1", "2026-09-27T18:40:00+00:00", "busy", ""
+    )
+
+    assert "web:demo:visitor-a:conv-1" not in server_mod._sync_state
+
+
+def test_the_sync_record_survives_a_restart(tmp_path, monkeypatch):
+    """Otherwise every restart turns every synced conversation back to pending."""
+    from cognee_integration_web_widget import server as server_mod
+
+    path = tmp_path / "sync.json"
+    monkeypatch.setattr(server_mod, "SYNC_STATE_PATH", str(path))
+    server_mod._sync_state.clear()
+    server_mod._record_distillation(
+        "web:demo:visitor-a:conv-1", "2026-09-27T18:20:00+00:00", "started", ""
+    )
+
+    reloaded = server_mod._load_sync_state()
+
+    assert reloaded["web:demo:visitor-a:conv-1"]["synced_until"] == "2026-09-27T18:20:00+00:00"
 
 
 def test_conversations_are_empty_before_anything_is_stored(dashboard_client, fake_client):
-    """The dataset is created by the first stored exchange, so its absence is an
-    empty list rather than an error - and no longer a wall of empty rows from a
-    cache whose contents were deleted."""
-    client = dashboard_client
-    fake_client.list_datasets = AsyncMock(return_value=[{"name": "web:demo:docs", "id": "d1"}])
-    fake_client.graph = AsyncMock(return_value={"nodes": [], "edges": []})
+    fake_client.list_sessions = AsyncMock(return_value=[])
 
-    body = client.get("/api/dashboard/conversations?token=s3cret").json()
+    body = dashboard_client.get("/api/dashboard/conversations?token=s3cret").json()
 
-    assert body == {
-        "dataset": "web:demo:conversations",
-        "exists": False,
-        "conversations": [],
-    }
-    fake_client.graph.assert_not_awaited()
+    assert body["conversations"] == []
+    assert body["pending"] == {"conversations": 0, "turns": 0, "soonest_expiry": ""}
 
 
 def test_conversation_memory_separates_lessons_from_turns(dashboard_client, fake_client):
@@ -1938,9 +2129,8 @@ def test_conversation_memory_separates_lessons_from_turns(dashboard_client, fake
     body = client.get("/api/dashboard/conversation-memory?token=s3cret").json()
 
     assert body["exists"] is True
-    # A transcript is a session; the bridge's copies are counted apart, since
-    # they hold the same turns minus whatever its watermark skipped.
-    assert body["counts"] == {"sessions": 0, "lessons": 1, "bridged_documents": 2}
+    # One saved conversation: its document counts, its chunk is part of it.
+    assert body["counts"] == {"sessions": 1, "lessons": 1}
     assert body["lessons"][0]["label"] == "text_lesson"
     assert body["counts"]["lessons"] == 1
     # Anything the three buckets did not claim is counted, not dropped.
@@ -1984,7 +2174,7 @@ def test_lessons_are_told_apart_by_node_set_not_by_name(dashboard_client, fake_c
     body = client.get("/api/dashboard/conversation-memory?token=s3cret").json()
 
     assert body["counts"]["lessons"] == 1
-    assert body["counts"]["bridged_documents"] == 1
+    assert body["counts"]["sessions"] == 1
     assert body["lessons"][0]["session"] == "web:demo:visitor-babepv87:conv-7d7fgmfw"
 
 

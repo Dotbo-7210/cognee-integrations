@@ -30,6 +30,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -133,112 +134,8 @@ class ForgetRequest(BaseModel):
     site_id: str = DEMO_SITE_ID
 
 
-# One document per conversation, named by its session id, holding the whole
-# transcript. Turns are appended to it.
-TRANSCRIPT_HEADER = "Conversation {session}\n"
-_TURN = "\nQ: {question}\n\nA: {answer}\n"
-
-
-def transcript_with(previous: str, session: str, question: str, answer: str) -> str:
-    """The transcript after this turn.
-
-    Append-only, and the whole file is rewritten each time rather than a
-    fragment being sent: cognee diffs it against the stored copy and re-ingests
-    only the chunks the new turn touched, so rewriting costs about what
-    appending would and needs no separate notion of where the file ended.
-    """
-    body = previous if previous.strip() else TRANSCRIPT_HEADER.format(session=session)
-    return body.rstrip("\n") + "\n" + _TURN.format(question=question.strip(), answer=answer.strip())
-
-
-def turns_from_transcript(text: str) -> list:
-    """The turns in a transcript, in the order they were asked."""
-    turns = []
-    for block in text.split("\nQ: ")[1:]:
-        question, _, answer = block.partition("\n\nA: ")
-        turns.append({"question": question.strip()[:2000], "answer": answer.strip()[:4000]})
-    return turns
-
-
-# One lock per conversation. Appending is read-modify-write against a document
-# in cognee, and two turns answered close together both read the transcript
-# before either had written: the second write landed on a copy that never had
-# the first turn in it, and one turn vanished. Holding a lock across the whole
-# read-and-write makes the sequence atomic.
-#
-# Per process, which is what this backend is. Two of them writing the same
-# conversation would race again, and the fix then is a conditional write cognee
-# does not currently offer - worth knowing before this is scaled out.
-_transcript_locks: dict = {}
-
-
-def _transcript_lock(session_id: str) -> asyncio.Lock:
-    lock = _transcript_locks.get(session_id)
-    if lock is None:
-        lock = _transcript_locks.setdefault(session_id, asyncio.Lock())
-    return lock
-
-
-async def _append_to_transcript(conversation, question: str, answer: str) -> None:
-    """Add this turn to the conversation's own transcript.
-
-    We write it rather than letting cognee's session bridge do it. The bridge
-    persisted turns from the session cache, and on this tenant it skipped one of
-    a three-turn conversation and then advanced its watermark past it, so the
-    turn could never be recovered - and it only ran at all because every answer
-    paid for a full improve. A file we own has neither problem: what is in it is
-    what was said.
-
-    Nothing here triggers distillation. Lessons come from improve(session_ids=...),
-    which reads the session cache and is run from the dashboard's Distil button
-    (``/api/dashboard/distil``), rather than from a remember() on every answer.
-    """
-    dataset = adapter.conversations_dataset(conversation.site_id)
-    name = conversation.session_id
-    try:
-        async with _transcript_lock(name):
-            await _write_turn(dataset, name, question, answer)
-    except Exception as error:  # noqa: BLE001 - the answer is already out
-        print(f"[web_widget] appending to the transcript failed: {error}")
-
-
-async def _write_turn(dataset: str, name: str, question: str, answer: str) -> None:
-    """Read the transcript, add this turn, put it back. Caller holds the lock."""
-    datasets = await adapter.client.list_datasets()
-    match = next((d for d in datasets if isinstance(d, dict) and d.get("name") == dataset), None)
-    existing = None
-    if match:
-        for item in await adapter.client.dataset_data(str(match.get("id"))):
-            if str(_field(item, "name")) == name:
-                existing = item
-                break
-
-    previous = ""
-    if existing:
-        raw = await adapter.client.fetch_raw(
-            dataset_id=str(match.get("id")), data_id=str(_field(existing, "id"))
-        )
-        previous = raw.decode("utf-8", "replace") if raw else ""
-
-    text = transcript_with(previous, name, question, answer)
-    if existing:
-        ok = await adapter.client.update_document(
-            data_id=str(_field(existing, "id")),
-            dataset_id=str(match.get("id")),
-            text=text,
-            filename=name,
-        )
-        # Checked rather than discarded: a refused patch is the one way a turn
-        # goes missing with nothing else noticing.
-        if not ok:
-            print(f"[web_widget] cognee refused the transcript update for {name}")
-    else:
-        # No session id: this must not wake the bridge.
-        await adapter.client.remember(text, dataset_name=dataset, filename=name)
-
-
 @app.post("/api/chat")
-async def chat(req: ChatRequest, background: BackgroundTasks) -> JSONResponse:
+async def chat(req: ChatRequest) -> JSONResponse:
     conversation = adapter.conversation(
         site_id=req.site_id, visitor_id=req.visitor_id, conversation_id=req.conversation_id
     )
@@ -263,12 +160,10 @@ async def chat(req: ChatRequest, background: BackgroundTasks) -> JSONResponse:
         query=req.message,
         remember=req.opt_in,
     )
-    if req.opt_in:
-        # After the response, not before it: reading the transcript, rewriting
-        # it and re-chunking are several round trips and the visitor has their
-        # reply already. A BackgroundTask rather than a loose create_task, so
-        # the work is owned by the request and cannot be dropped on shutdown.
-        background.add_task(_append_to_transcript, conversation, req.message, answer.text)
+    # Nothing else to store: with a session id, cognee's session-aware recall
+    # keeps the turn in the conversation's session itself, and distillation
+    # moves it into permanent memory from there. The backend used to write its
+    # own transcript as well, which only duplicated what the session holds.
     return JSONResponse(answer.as_dict())
 
 
@@ -594,15 +489,33 @@ async def dashboard_analytics(
     # The totals below are therefore the window's, matching the question counts
     # beside them rather than reporting lifetime figures under a "last N days"
     # heading.
+    baseline = _baseline()
     sessions = [
         x
         for x in await adapter.client.list_sessions()
-        if str(_field(x, "session_id")).startswith(prefix) and _active_since(x, cutoff)
+        if str(_field(x, "session_id")).startswith(prefix)
+        and _active_since(x, cutoff)
+        and not _before_baseline(x, baseline)
     ]
 
     details = await asyncio.gather(
         *(adapter.client.session_detail(str(_field(x, "session_id"))) for x in sessions)
     )
+
+    # Only what the Conversations section shows: a session that holds a
+    # question in this window. cognee keeps listing sessions whose turns are
+    # gone - a probe, or a conversation wiped with a dataset - with their token
+    # totals intact, and counting those reported over a million tokens for one
+    # conversation's worth of questions.
+    def asked_in_window(detail) -> bool:
+        return any(
+            not str(_field(qa, "time")) or str(_field(qa, "time")) >= cutoff
+            for qa in detail.get("qas") or []
+        )
+
+    kept = [(x, d) for x, d in zip(sessions, details) if asked_in_window(d)]
+    sessions = [x for x, _ in kept]
+    details = [d for _, d in kept]
 
     visitors, per_day, questions = set(), {}, []
     answered = unanswered = 0
@@ -717,24 +630,35 @@ def _summarise_graph(graph: dict) -> dict:
     }
 
 
-def _graph_cache_fresh(dataset_id: str) -> bool:
+def _graph_cache_fresh(dataset_id: str, max_age: float = _GRAPH_TTL_SECONDS) -> bool:
     return bool(
         _graph_cache["summary"]
         and _graph_cache["dataset"] == dataset_id
-        and time.time() - _graph_cache["at"] < _GRAPH_TTL_SECONDS
+        and time.time() - _graph_cache["at"] < max_age
     )
 
 
-async def _graph_summary(dataset_id: str) -> dict:
+# How recent a summary must be to answer a refresh. Long enough that a second
+# click, or a second operator refreshing at the same time, is served the fetch
+# the first one just paid for rather than pulling the whole graph again.
+_GRAPH_REFRESH_SECONDS = 30
+
+
+async def _graph_summary(dataset_id: str, fresh: bool = False) -> dict:
     """The summary, from cache when it is warm.
 
     One fetch at a time: two dashboards opening together would otherwise pull
     46MB each to compute the same counts.
+
+    ``fresh`` is the dashboard's Refresh: during an ingest the fifteen-minute
+    cache is exactly what hides progress, so it is skipped unless it was filled
+    moments ago.
     """
-    if _graph_cache_fresh(dataset_id):
+    max_age = _GRAPH_REFRESH_SECONDS if fresh else _GRAPH_TTL_SECONDS
+    if _graph_cache_fresh(dataset_id, max_age):
         return dict(_graph_cache["summary"], cached=True)
     async with _graph_lock:
-        if _graph_cache_fresh(dataset_id):
+        if _graph_cache_fresh(dataset_id, max_age):
             return dict(_graph_cache["summary"], cached=True)
         summary = _summarise_graph(await adapter.client.graph(dataset_id))
         _graph_cache.update({"summary": summary, "at": time.time(), "dataset": dataset_id})
@@ -770,7 +694,9 @@ async def dashboard_repositories(token: Optional[str] = Query(default=None)) -> 
 
 
 @app.get("/api/dashboard/graph")
-async def dashboard_graph(token: Optional[str] = Query(default=None)) -> JSONResponse:
+async def dashboard_graph(
+    token: Optional[str] = Query(default=None), fresh: bool = Query(default=False)
+) -> JSONResponse:
     """What the knowledge graph is made of, as counts.
 
     The graph itself is 46MB for this corpus - 35k nodes and 116k edges - and a
@@ -782,7 +708,7 @@ async def dashboard_graph(token: Optional[str] = Query(default=None)) -> JSONRes
     page should paint without waiting for something most visits do not open.
     """
     _require_dashboard(token)
-    summary = await _graph_summary(await _docs_dataset_id())
+    summary = await _graph_summary(await _docs_dataset_id(), fresh=fresh)
     return JSONResponse(
         {
             **summary,
@@ -1070,7 +996,6 @@ def _conversation_memory(graph: dict) -> dict:
         return ""
 
     sessions, lessons, other = [], [], Counter()
-    bridged = 0
     for node in nodes:
         kind = str(_field(node, "type") or "unknown")
         label = str(_field(node, "label"))[:200]
@@ -1094,17 +1019,17 @@ def _conversation_memory(graph: dict) -> dict:
                 lessons.append(entry)
             else:
                 other[kind] += 1  # chunks and entities derived from a lesson
-        elif label.startswith("web:"):
-            # A transcript, written by us and named after its conversation. The
-            # authoritative record: it has every turn.
-            sessions.append(entry)
         elif PERSISTED_SESSIONS_NODE_SET not in tag:
+            # Includes the transcripts the backend used to write, named
+            # "web:...": no longer written, and not counted as conversations.
             other[kind] += 1
-        elif kind in ("TextDocument", "DocumentChunk"):
-            # What the session bridge persisted, if it has run. Counted apart
-            # from the transcripts rather than added to them: it holds the same
-            # conversations over again, minus whatever its watermark skipped.
-            bridged += 1
+        elif kind == "TextDocument":
+            # A conversation distillation persisted into permanent memory, one
+            # document per session. Its chunks are the same conversation cut
+            # up, so they are not counted again.
+            sessions.append(entry)
+        elif kind == "DocumentChunk":
+            pass  # a piece of a saved conversation, counted with its document
         else:
             # Entities and summaries cognify derives from a persisted session:
             # real content, but not one of the three things this view is about.
@@ -1114,60 +1039,176 @@ def _conversation_memory(graph: dict) -> dict:
         "sessions": sessions[:200],
         "lessons": lessons[:200],
         "counts": {
-            # Transcripts, which is what a conversation is here.
+            # Conversations in permanent memory: one per distilled session.
             "sessions": len(sessions),
             "lessons": len(lessons),
-            # cognee's own copies of the same conversations, kept visible so the
-            # cognify they cost is not invisible. Zero until something distils.
-            "bridged_documents": bridged,
         },
         "unclassified": [{"type": k, "count": v} for k, v in other.most_common(10)],
     }
 
 
-@app.get("/api/dashboard/conversations")
-async def dashboard_conversations(token: Optional[str] = Query(default=None)) -> JSONResponse:
-    """Conversations, read from the transcript written for each one.
+# How long cognee keeps a session after its last activity. cognee's
+# session_ttl_seconds defaults to seven days, refreshed on write; the tenant
+# does not expose the value it actually uses (COGNEE-FINDINGS #9), so this is
+# an estimate, and the dashboard says so.
+SESSION_TTL = timedelta(days=float(os.getenv("WIDGET_SESSION_TTL_DAYS", "7")))
 
-    One document per conversation, named by its session id, so a conversation
-    is a document rather than something reassembled from scattered parts. Two
-    earlier sources failed at exactly that: the session cache kept an index
-    whose entries outlived their contents, and the bridge's per-turn documents
-    silently lost a turn to a watermark.
 
-    The bodies are read one per conversation. That is a round trip each, which
-    is why it reads the listing first and fetches only documents named like a
-    session - the dataset also holds distilled lessons, and they are not
-    transcripts.
+def _parse_time(value) -> Optional[datetime]:
+    """An ISO-8601 timestamp as an aware datetime, or None. Naive means UTC."""
+    if not value:
+        return None
+    try:
+        at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+
+
+def _conversation_sync(session_id: str, qas: list, session) -> dict:
+    """A conversation's turns with their sync status, and its status as a whole.
+
+    A turn is synced once a distillation run over its session has finished and
+    the turn was asked before that run started; until then it is pending, held
+    only in cognee's session memory, which expires.
     """
-    _require_dashboard(token)
-    dataset = adapter.conversations_dataset(DEMO_SITE_ID)
-    datasets = await adapter.client.list_datasets()
-    match = next((d for d in datasets if isinstance(d, dict) and d.get("name") == dataset), None)
-    if not match:
-        return JSONResponse({"dataset": dataset, "exists": False, "conversations": []})
+    record = _sync_state.get(session_id) or {}
+    synced_until = _parse_time(record.get("synced_until"))
 
-    dataset_id = str(match.get("id"))
-    items = await adapter.client.dataset_data(dataset_id)
-    wanted = [i for i in items if str(_field(i, "name")).startswith(f"web:{DEMO_SITE_ID}:")][:100]
+    turns = []
+    for qa in qas:
+        at = _parse_time(_field(qa, "time"))
+        synced = bool(synced_until and at and at <= synced_until)
+        turns.append(
+            {
+                "question": str(_field(qa, "question"))[:2000],
+                "answer": str(_field(qa, "answer"))[:4000],
+                "at": at.isoformat() if at else "",
+                "sync": "synced" if synced else "pending",
+            }
+        )
 
+    pending = sum(1 for t in turns if t["sync"] == "pending")
+    last_activity = _parse_time(_field(session, "last_activity_at", "ended_at", "started_at"))
+    expires_at = last_activity + SESSION_TTL if (pending and last_activity) else None
+    return {
+        "turns": turns,
+        "pending": pending,
+        "synced": len(turns) - pending,
+        "synced_at": record.get("synced_at", ""),
+        "last_failure": record.get("last_failure", ""),
+        "expires_at": expires_at.isoformat() if expires_at else "",
+    }
+
+
+# "Start fresh": sessions that began before this moment are ignored - not shown,
+# not pending, not distilled. cognee's HTTP API cannot delete a session, so this
+# is how an operator gets a clean slate. Kept in the sync record, under a key no
+# session id can take.
+BASELINE_KEY = "__baseline__"
+
+
+def _baseline() -> Optional[datetime]:
+    return _parse_time((_sync_state.get(BASELINE_KEY) or {}).get("at"))
+
+
+def _before_baseline(session, baseline: Optional[datetime]) -> bool:
+    """Whether a session began before the baseline, and so is ignored whole.
+
+    Whole rather than turn by turn: distilling a session hands cognee all of it,
+    so a pre-baseline conversation that carries on would pull its old turns into
+    permanent memory with the new ones.
+    """
+    if not baseline:
+        return False
+    started = _parse_time(_field(session, "started_at", "last_activity_at"))
+    return bool(started and started <= baseline)
+
+
+async def _widget_conversations() -> list:
+    """Every widget conversation cognee still holds, with its turns.
+
+    Read from cognee's sessions: the widget stores nothing of its own, because
+    session-aware recall already keeps every turn there. A session with no
+    questions - a probe, or one opened and never used - is not a conversation,
+    and neither is one from before a "start fresh". One detail call per
+    session, since the listing carries no turns.
+    """
+    prefix = f"web:{DEMO_SITE_ID}:"
+    baseline = _baseline()
+    sessions = [
+        x
+        for x in await adapter.client.list_sessions()
+        if str(_field(x, "session_id")).startswith(prefix) and not _before_baseline(x, baseline)
+    ]
     limit = asyncio.Semaphore(4)
 
-    async def read(item) -> dict:
+    async def read(session) -> Optional[dict]:
+        session_id = str(_field(session, "session_id"))
         async with limit:
-            raw = await adapter.client.fetch_raw(
-                dataset_id=dataset_id, data_id=str(_field(item, "id"))
-            )
-        name = str(_field(item, "name"))
-        parts = name.split(":")
+            detail = await adapter.client.session_detail(session_id)
+        qas = detail.get("qas") or []
+        if not qas:
+            return None
+        parts = session_id.split(":")
         return {
-            "session_id": name,
-            "visitor": parts[2] if len(parts) > 2 else name,
-            "turns": turns_from_transcript(raw.decode("utf-8", "replace") if raw else ""),
+            "session_id": session_id,
+            "visitor": parts[2] if len(parts) > 2 else session_id,
+            **_conversation_sync(session_id, qas, session),
         }
 
-    conversations = await asyncio.gather(*(read(i) for i in wanted))
-    return JSONResponse({"dataset": dataset, "exists": True, "conversations": list(conversations)})
+    found = [c for c in await asyncio.gather(*(read(x) for x in sessions)) if c]
+    # Most recently active first: the ones nearest to being forgotten are at the
+    # bottom of the pending list, but the ones being talked in are what an
+    # operator opens this to look at.
+    return sorted(found, key=lambda c: c["turns"][-1]["at"], reverse=True)
+
+
+@app.get("/api/dashboard/conversations")
+async def dashboard_conversations(token: Optional[str] = Query(default=None)) -> JSONResponse:
+    """Widget conversations, each turn marked synced or pending.
+
+    A pending conversation carries when cognee is expected to forget it: after
+    that its session is gone and there is nothing left to distil it from.
+    """
+    _require_dashboard(token)
+    conversations = (await _widget_conversations())[:100]
+    pending = [c for c in conversations if c["pending"]]
+    soonest = min((c["expires_at"] for c in pending if c["expires_at"]), default="")
+    return JSONResponse(
+        {
+            "exists": True,
+            "conversations": conversations,
+            "pending": {
+                "conversations": len(pending),
+                "turns": sum(c["pending"] for c in pending),
+                "soonest_expiry": soonest,
+            },
+            # Whether the sync record survives a restart, so the page can say
+            # when it does not.
+            "sync_state_persisted": bool(SYNC_STATE_PATH),
+            "baseline": (_sync_state.get(BASELINE_KEY) or {}).get("at", ""),
+        }
+    )
+
+
+@app.post("/api/dashboard/conversations/start-fresh")
+async def dashboard_start_fresh(token: Optional[str] = Query(default=None)) -> JSONResponse:
+    """Ignore every conversation that exists now; only new ones count from here."""
+    _require_dashboard(token)
+    at = datetime.now(timezone.utc).isoformat()
+    _sync_state[BASELINE_KEY] = {"at": at}
+    _save_sync_state()
+    return JSONResponse({"baseline": at})
+
+
+@app.delete("/api/dashboard/conversations/start-fresh")
+async def dashboard_undo_start_fresh(token: Optional[str] = Query(default=None)) -> JSONResponse:
+    """Show the conversations from before the last "start fresh" again."""
+    _require_dashboard(token)
+    _sync_state.pop(BASELINE_KEY, None)
+    _save_sync_state()
+    return JSONResponse({"baseline": ""})
 
 
 @app.get("/api/dashboard/conversation-memory")
@@ -1226,6 +1267,69 @@ async def dashboard_clear_conversations(
 _distil_run: dict = {"running": False}
 
 
+# Which conversations have been synced into cognee's permanent memory, and up
+# to when. A turn is pending until a distillation run over its session has
+# finished; then every turn asked before that run started is synced.
+#
+# cognee cannot answer this itself: the per-turn memify_metadata it keeps stays
+# empty after a distillation, and the copy improve writes into the graph can
+# skip turns (COGNEE-FINDINGS #1). So the record is ours, kept in a small JSON
+# file so a restart does not turn every synced conversation back to pending.
+# Unset, it lives in memory only and a restart forgets it.
+SYNC_STATE_PATH = os.getenv("WIDGET_SYNC_STATE_PATH", "").strip() or None
+
+
+def _load_sync_state() -> dict:
+    if not SYNC_STATE_PATH:
+        return {}
+    try:
+        data = json.loads(Path(SYNC_STATE_PATH).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as error:  # noqa: BLE001 - a bad file must not stop the backend
+        print(f"[web_widget] ignoring unreadable sync state {SYNC_STATE_PATH}: {error}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+_sync_state: dict = _load_sync_state()
+
+
+def _save_sync_state() -> None:
+    """Write the record whole, through a temporary file, so a crash mid-write
+    leaves the previous version rather than half of one."""
+    if not SYNC_STATE_PATH:
+        return
+    target = Path(SYNC_STATE_PATH)
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(_sync_state, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, target)
+    except Exception as error:  # noqa: BLE001 - the run itself still happened
+        print(f"[web_widget] could not save sync state to {SYNC_STATE_PATH}: {error}")
+
+
+def _record_distillation(session_id: str, started_at: str, outcome: str, status: str) -> None:
+    """Mark a session synced up to when its run started, or note that it failed.
+
+    A run cognee reports as errored leaves the session pending. One it reports
+    in any other way - or does not report on at all - counts as synced, since
+    cognee gives no per-stage result to check against. A busy session was not
+    run, so nothing changes.
+    """
+    if outcome == "busy":
+        return
+    entry = dict(_sync_state.get(session_id) or {})
+    now = datetime.now(timezone.utc).isoformat()
+    if outcome == "failed" or "errored" in status.lower():
+        entry.update({"last_failed_at": now, "last_failure": status or "failed"})
+    else:
+        entry.update({"synced_until": started_at, "synced_at": now, "status": status})
+        entry.pop("last_failure", None)
+    _sync_state[session_id] = entry
+    _save_sync_state()
+
+
 async def _distil_all(dataset_id: str, session_ids: list[str]) -> None:
     """Ask cognee to improve each session in turn, a couple at a time.
 
@@ -1237,11 +1341,16 @@ async def _distil_all(dataset_id: str, session_ids: list[str]) -> None:
 
     async def one(session_id: str) -> None:
         async with limit:
+            # Before the request: turns asked while it runs may not be in it.
+            started_at = datetime.now(timezone.utc).isoformat()
             try:
-                outcome = await adapter.client.improve_session(session_id, dataset_id=dataset_id)
+                outcome, status = await adapter.client.improve_session(
+                    session_id, dataset_id=dataset_id
+                )
             except Exception as error:  # noqa: BLE001 - one session must not stop the rest
                 print(f"[web_widget] improving {session_id} failed: {error}")
-                outcome = "failed"
+                outcome, status = "failed", ""
+        _record_distillation(session_id, started_at, outcome, status)
         _distil_run["outcomes"][outcome] = _distil_run["outcomes"].get(outcome, 0) + 1
 
     try:
@@ -1255,62 +1364,40 @@ async def _distil_all(dataset_id: str, session_ids: list[str]) -> None:
 async def dashboard_distil(
     background: BackgroundTasks, token: Optional[str] = Query(default=None)
 ) -> JSONResponse:
-    """Distil every saved conversation - each transcript in the dataset.
+    """Distil every widget conversation that has turns not yet synced.
 
-    Deciding what is pending is left to cognee. Each improve stage keeps a
-    per-session watermark, so a conversation already distilled, or one that
-    produced nothing worth keeping, is skipped without an LLM call, and one that
-    has grown since its last run is distilled for its new turns only.
+    The conversations are cognee's own sessions (see ``_widget_conversations``),
+    and pending means not yet covered by a finished distillation. cognee keeps
+    its own per-session watermarks as well, so a run over a session with
+    nothing new costs no LLM calls either way.
 
-    Only sessions still in cognee's session cache can be distilled - that is
-    what distillation reads. A conversation whose session has expired keeps its
-    transcript, but there is nothing left to distil it from.
+    Lessons and cognee's persisted copy of each session land in the widget's
+    conversations dataset, which this creates if it does not exist yet: improve
+    fails, non-fatally, on a dataset that is not there.
     """
     _require_dashboard(token)
     if _distil_run["running"]:
         raise HTTPException(status_code=409, detail="a distillation run is already in progress")
 
     dataset = adapter.conversations_dataset(DEMO_SITE_ID)
-    datasets = await adapter.client.list_datasets()
-    match = next((d for d in datasets if isinstance(d, dict) and d.get("name") == dataset), None)
-    if not match:
-        return JSONResponse({"dataset": dataset, "exists": False, "sessions": 0})
-
-    # The saved conversations are the transcripts in this dataset, one document
-    # per conversation, named by its session id. cognee's session list is not
-    # the same thing: it holds every session any recall ever opened - probes,
-    # empty ones, conversations from before the dataset was last cleared - and
-    # clearing the dataset does not remove them. Distilling from that list ran
-    # improve over twenty-three sessions for one stored conversation.
-    prefix = f"web:{DEMO_SITE_ID}:"
-    items = await adapter.client.dataset_data(str(match.get("id")))
-    saved = {
-        str(_field(i, "name")) for i in items if str(_field(i, "name")).startswith(prefix)
-    }
-    # Distillation reads the session cache, not the transcript, so a saved
-    # conversation whose session has gone has nothing left to distil from.
-    live = {str(_field(s, "session_id")) for s in await adapter.client.list_sessions()}
-    session_ids = sorted(saved & live)
-    expired = len(saved - live)
+    session_ids = [c["session_id"] for c in await _widget_conversations() if c["pending"]]
     if not session_ids:
-        return JSONResponse(
-            {"dataset": dataset, "exists": True, "sessions": 0, "expired": expired}
-        )
+        return JSONResponse({"dataset": dataset, "sessions": 0})
+    dataset_id = await adapter.client.ensure_dataset(dataset)
+    if not dataset_id:
+        raise HTTPException(status_code=502, detail=f"cognee would not create {dataset}")
 
     _distil_run.clear()
     _distil_run.update(
         {
             "running": True,
             "sessions": len(session_ids),
-            "expired": expired,
             "outcomes": {},
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
     )
-    background.add_task(_distil_all, str(match.get("id")), session_ids)
-    return JSONResponse(
-        {"dataset": dataset, "exists": True, "sessions": len(session_ids), "expired": expired}
-    )
+    background.add_task(_distil_all, dataset_id, session_ids)
+    return JSONResponse({"dataset": dataset, "sessions": len(session_ids)})
 
 
 @app.get("/api/dashboard/distil")
