@@ -14,7 +14,8 @@ Contract:
     goes by (its UUIDs under shared memory, its name when name-addressed);
   * ``cached_readable_datasets`` returns the rows: a fresh cache without the
     network, a stale one refreshed, the stale rows kept when the refresh fails,
-    and never a listing fetched for another server/identity;
+    a failed refresh not retried before ``COGNEE_DATASETS_CACHE_RETRY``, and never
+    a listing fetched for another server/identity;
   * the hook appends the hint on the session's FIRST prompt the server
     ANSWERED — hit or not, since graph retrieval always returns something and
     only the model can judge whether it answers the user — and again on any
@@ -169,6 +170,63 @@ def test_failed_refresh_with_no_cache_is_empty_not_an_error(pc, monkeypatch):
 
     monkeypatch.setattr(pc, "list_readable_datasets", boom)
     assert pc.cached_readable_datasets(service_url=URL) == []
+
+
+def test_failed_refresh_is_not_retried_inside_the_backoff(pc, cache, monkeypatch):
+    pc.cached_readable_datasets(service_url=URL)
+    attempts: list[str] = []
+
+    def boom(*a, **k):
+        attempts.append("server")
+        raise OSError("timed out")
+
+    monkeypatch.setattr(pc, "list_readable_datasets", boom)
+    assert pc.cached_readable_datasets(service_url=URL, max_age=0) == ROWS
+    assert pc.cached_readable_datasets(service_url=URL, max_age=0) == ROWS
+    assert pc.cached_readable_datasets(service_url=URL, max_age=0) == ROWS
+    assert attempts == ["server"]
+    stored = json.loads(pc._READABLE_DATASETS_CACHE.read_text(encoding="utf-8"))
+    assert stored["datasets"] == ROWS and stored["failed_at"] > 0
+
+
+def test_failed_refresh_is_retried_once_the_backoff_has_passed(pc, cache, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("timed out")
+
+    monkeypatch.setattr(pc, "list_readable_datasets", boom)
+    assert pc.cached_readable_datasets(service_url=URL) == []
+    stored = json.loads(pc._READABLE_DATASETS_CACHE.read_text(encoding="utf-8"))
+    stored["failed_at"] = time.time() - 10_000
+    pc._READABLE_DATASETS_CACHE.write_text(json.dumps(stored), encoding="utf-8")
+    monkeypatch.setattr(pc, "list_readable_datasets", lambda *a, **k: list(ROWS))
+    assert pc.cached_readable_datasets(service_url=URL) == ROWS
+    stored = json.loads(pc._READABLE_DATASETS_CACHE.read_text(encoding="utf-8"))
+    assert "failed_at" not in stored
+
+
+def test_backoff_window_is_configurable(pc, cache, monkeypatch):
+    monkeypatch.setenv("COGNEE_DATASETS_CACHE_RETRY", "0")
+    attempts: list[str] = []
+
+    def boom(*a, **k):
+        attempts.append("server")
+        raise OSError("timed out")
+
+    monkeypatch.setattr(pc, "list_readable_datasets", boom)
+    pc.cached_readable_datasets(service_url=URL)
+    pc.cached_readable_datasets(service_url=URL)
+    assert attempts == ["server", "server"]
+
+
+def test_a_failure_for_one_identity_does_not_defer_another(pc, cache, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("timed out")
+
+    monkeypatch.setattr(pc, "list_readable_datasets", boom)
+    assert pc.cached_readable_datasets(service_url=URL) == []
+    monkeypatch.setattr(pc, "list_readable_datasets", lambda *a, **k: list(ROWS))
+    monkeypatch.setattr(pc, "_api_key", lambda: "key-2")
+    assert pc.cached_readable_datasets(service_url=URL) == ROWS
 
 
 def test_cache_is_keyed_by_server_and_identity(pc, cache, monkeypatch):

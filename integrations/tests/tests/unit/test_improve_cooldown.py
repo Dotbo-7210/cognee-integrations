@@ -129,13 +129,13 @@ def test_a_new_success_restarts_the_window(pc, monkeypatch):
 
 def test_cooldown_default_and_parsing(pc, monkeypatch):
     monkeypatch.delenv("COGNEE_IMPROVE_COOLDOWN", raising=False)
-    assert pc.improve_cooldown_seconds() == 1800.0
+    assert pc.improve_cooldown_seconds() == 5400.0
     monkeypatch.setenv("COGNEE_IMPROVE_COOLDOWN", "90")
     assert pc.improve_cooldown_seconds() == 90.0
     monkeypatch.setenv("COGNEE_IMPROVE_COOLDOWN", "-5")
     assert pc.improve_cooldown_seconds() == 0.0
     monkeypatch.setenv("COGNEE_IMPROVE_COOLDOWN", "soon")
-    assert pc.improve_cooldown_seconds() == 1800.0
+    assert pc.improve_cooldown_seconds() == 5400.0
 
 
 def test_auto_improve_every_zero_disables(pc, monkeypatch):
