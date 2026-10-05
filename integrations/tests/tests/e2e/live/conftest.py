@@ -377,12 +377,13 @@ def synced_turn(started_session, graph: GraphClient):
     """Write one turn into the graph, then keep the server up for the test.
 
     Prompt recall reads the graph only: the session cache is written, never
-    searched. On cognee >= 1.6.0 the graph item's text also carries the
-    session's own history, but only once the dataset has a graph — before the
-    first cognify the graph scope answers 404 and nothing is injected. Any
-    test that expects a recall to find something therefore pays for one real
-    sync first; this does it and waits on recall, the only honest readiness
-    gate (``wait_for_sync`` returns on any earlier ``sync_bridge_done`` too).
+    searched, and the graph request carries no session id, so a session's own
+    turns reach recall only after a sync has bridged them into the graph
+    (SDK-904). Recall also injects nothing until the dataset has a graph —
+    before the first cognify the graph scope answers 404. Any test that
+    expects a recall to find something therefore pays for one real sync
+    first; this does it and waits on recall, the only honest readiness gate
+    (``wait_for_sync`` returns on any earlier ``sync_bridge_done`` too).
 
     ``terms`` must not appear in ``query``: an ``only_context`` recall echoes
     the question back, so a term taken from it would match trivially.
