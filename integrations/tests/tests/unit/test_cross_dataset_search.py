@@ -172,8 +172,18 @@ def test_failed_refresh_with_no_cache_is_empty_not_an_error(pc, monkeypatch):
     assert pc.cached_readable_datasets(service_url=URL) == []
 
 
+def _age_the_cache(pc) -> None:
+    """Date the stored listing far into the past. ``max_age=0`` is not enough:
+    on Windows ``time.time()`` ticks in ~15 ms steps, so a listing fetched a
+    moment ago can be exactly 0 s old and count as fresh."""
+    stored = json.loads(pc._READABLE_DATASETS_CACHE.read_text(encoding="utf-8"))
+    stored["fetched_at"] = time.time() - 10_000
+    pc._READABLE_DATASETS_CACHE.write_text(json.dumps(stored), encoding="utf-8")
+
+
 def test_failed_refresh_is_not_retried_inside_the_backoff(pc, cache, monkeypatch):
     pc.cached_readable_datasets(service_url=URL)
+    _age_the_cache(pc)
     attempts: list[str] = []
 
     def boom(*a, **k):
@@ -181,9 +191,9 @@ def test_failed_refresh_is_not_retried_inside_the_backoff(pc, cache, monkeypatch
         raise OSError("timed out")
 
     monkeypatch.setattr(pc, "list_readable_datasets", boom)
-    assert pc.cached_readable_datasets(service_url=URL, max_age=0) == ROWS
-    assert pc.cached_readable_datasets(service_url=URL, max_age=0) == ROWS
-    assert pc.cached_readable_datasets(service_url=URL, max_age=0) == ROWS
+    assert pc.cached_readable_datasets(service_url=URL) == ROWS
+    assert pc.cached_readable_datasets(service_url=URL) == ROWS
+    assert pc.cached_readable_datasets(service_url=URL) == ROWS
     assert attempts == ["server"]
     stored = json.loads(pc._READABLE_DATASETS_CACHE.read_text(encoding="utf-8"))
     assert stored["datasets"] == ROWS and stored["failed_at"] > 0
