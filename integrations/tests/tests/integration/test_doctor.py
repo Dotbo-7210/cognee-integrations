@@ -28,6 +28,7 @@ _REPORT_KEYS = {
     "memory_sharing",
     "reachable",
     "latency_ms",
+    "runtime_python",
     "cognee_local",
     "cognee_server",
     "embedding_model",
@@ -88,5 +89,6 @@ def test_human_output_contains_header(doctor, mock_server):
     text = doctor.format_human(doctor.collect_report())
     assert "Cognee Doctor" in text
     assert "Mode:" in text
+    assert "Runtime Python:" in text
     assert "Cognee (local):" in text
     assert "Circuit Breaker:" in text

@@ -209,6 +209,71 @@ def _resolve_server_version(health_body: dict | None) -> str:
     return "Unknown"
 
 
+_RUNTIME_PYTHON_MIN = (3, 10)
+_RUNTIME_PYTHON_MAX = (3, 14)
+_HOST_PYTHON_CANDIDATES = (
+    "python3.14",
+    "python3.13",
+    "python3.12",
+    "python3.11",
+    "python3.10",
+    "python3",
+    "python",
+)
+
+
+def _python_version_of(python: str) -> tuple:
+    """``(major, minor, micro)`` of an interpreter on disk, or ``()``."""
+    try:
+        out = subprocess.run(
+            [python, "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return tuple(int(part) for part in out.stdout.strip().split("."))
+    except Exception:
+        pass
+    return ()
+
+
+def _resolve_runtime_python() -> str:
+    """The Python the local Cognee server runs on — or why there is none.
+
+    Cognee requires 3.10-3.14 and the plugin builds its runtime venv only from an
+    interpreter already installed (it downloads none), so this is the first thing
+    to check when local mode will not start. Reports the venv's interpreter once
+    built; before that, the SessionStart refusal marker if one was recorded,
+    otherwise the newest suitable ``python3.x`` on PATH (the one the next session
+    start will use). Read-only: probes versions, builds nothing.
+    """
+    import shutil
+
+    from _plugin_common import _SHARED_PLUGIN_ROOT, _VENV_PYTHON
+
+    if _resolve_mode() == "Cloud":
+        return "Not needed (remote server)"
+    if _VENV_PYTHON.exists():
+        version = _python_version_of(str(_VENV_PYTHON))
+        label = ".".join(str(part) for part in version) if version else "unknown version"
+        return f"{label} (plugin venv)"
+    need = "Cognee needs Python {}.{}-{}.{}".format(*_RUNTIME_PYTHON_MIN, *_RUNTIME_PYTHON_MAX)
+    marker = _SHARED_PLUGIN_ROOT / "host-python-unsupported.json"
+    if marker.exists():
+        return f"MISSING - {need}; none found at last session start (install one, then restart)"
+    seen = set()
+    for name in _HOST_PYTHON_CANDIDATES + (sys.executable,):
+        found = shutil.which(name) if os.sep not in name else name
+        if not found or found in seen:
+            continue
+        seen.add(found)
+        version = _python_version_of(found)
+        if version and _RUNTIME_PYTHON_MIN <= version[:2] <= _RUNTIME_PYTHON_MAX:
+            return "{}.{}.{} ({}, venv not built yet)".format(*version[:3], found)
+    return f"MISSING - {need}; none found on PATH (install one, then start a session)"
+
+
 def _resolve_circuit_breaker() -> str:
     """Return a human description of the circuit breaker state."""
     from _cognee_client import breaker_open
@@ -261,6 +326,7 @@ def collect_report() -> dict:
     health = _check_health(raw_url)
     cognee_server = _resolve_server_version(health["raw_body"])
     cognee_local = _resolve_local_cognee_version()
+    runtime_python = _resolve_runtime_python()
     circuit_breaker = _resolve_circuit_breaker()
     embedding_model, embedding_dimensions = _resolve_embedding()
 
@@ -272,6 +338,7 @@ def collect_report() -> dict:
         "memory_sharing": memory_sharing,
         "reachable": health["reachable"],
         "latency_ms": health["latency_ms"],
+        "runtime_python": runtime_python,
         "cognee_local": cognee_local,
         "cognee_server": cognee_server,
         "embedding_model": embedding_model,
@@ -288,6 +355,7 @@ _DISPLAY_ORDER = [
     ("Memory Sharing", "memory_sharing"),
     ("Reachable", "reachable"),
     ("Latency", "latency_ms"),
+    ("Runtime Python", "runtime_python"),
     ("Cognee (local)", "cognee_local"),
     ("Cognee (server)", "cognee_server"),
     ("Embedding Model", "embedding_model"),

@@ -160,6 +160,48 @@ def test_concurrent_appends_do_not_lose_entries(pc, monkeypatch):
     assert sorted(e["origin_function"] for e in _pending(pc)) == [f"tool{i}" for i in range(8)]
 
 
+def test_lock_treats_windows_delete_pending_as_busy(pc, monkeypatch):
+    """A PermissionError from O_CREAT|O_EXCL is contention, not a broken lock.
+
+    On Windows a lock file its holder has just unlinked stays "delete pending"
+    while another waiter still has a handle on it, and creating it again in that
+    window fails with "access denied" instead of "exists". That used to take the
+    error branch and fail open without the lock -- the lost append seen in CI.
+    The lock must keep waiting and then acquire normally.
+    """
+    real_open = pc.os.open
+    denied = {"left": 3}
+
+    def _open(path, flags, *args, **kwargs):
+        if str(path) == str(pc._BUFFER_LOCK) and flags & pc.os.O_EXCL and denied["left"]:
+            denied["left"] -= 1
+            raise PermissionError(13, "Access is denied")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(pc.os, "open", _open)
+    with pc._buffer_lock() as acquired:
+        assert acquired is True
+    assert denied["left"] == 0  # it retried through every denial
+    assert not pc._BUFFER_LOCK.exists()
+
+
+def test_lock_still_fails_open_when_denied_past_the_deadline(pc, events, monkeypatch):
+    """The retry is bounded: a permanently denied create times out like a held
+    lock does -- logged as a timeout, never as a hook-stopping error."""
+    monkeypatch.setattr(pc, "_BUFFER_LOCK_TIMEOUT_SECONDS", 0.05)
+    real_open = pc.os.open
+
+    def _open(path, flags, *args, **kwargs):
+        if str(path) == str(pc._BUFFER_LOCK) and flags & pc.os.O_EXCL:
+            raise PermissionError(13, "Access is denied")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(pc.os, "open", _open)
+    with pc._buffer_lock() as acquired:
+        assert acquired is False
+    assert [ev for ev, _ in events] == ["buffer_lock_timeout"]
+
+
 def test_append_fails_open_when_lock_held(pc, monkeypatch):
     # A wedged lock must never make a hook hang or drop the entry: after the
     # short wait the append proceeds without the lock.

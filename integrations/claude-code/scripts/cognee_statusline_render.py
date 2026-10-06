@@ -290,6 +290,13 @@ _RESET = "\033[0m"
 _COGNEE_KEY_REASON = "incorrect_cognee_api_key"
 _LLM_KEY_REASON = "incorrect_llm_api_key"
 _MISSING_URL_REASON = "missing_cognee_base_url"
+# Local mode with no Python the Cognee server can run on. SessionStart writes the
+# marker when it finds no 3.10+ interpreter (the plugin does not download one) and
+# clears it once a runtime venv exists; like the missing-URL case it is proven
+# from local state, not inferred from a failed connection — so it is shown at
+# once, and named for the fix rather than the symptom (``unreachable``).
+_PYTHON_REQUIRED_REASON = "cognee_needs_python_3_10"
+_HOST_PYTHON_MARKER = _SHARED_ROOT / "host-python-unsupported.json"
 _REASON_LABELS = {"auth_failed": _COGNEE_KEY_REASON}
 
 
@@ -801,6 +808,17 @@ def _forced_cloud_unconfigured() -> bool:
     return not os.environ.get("COGNEE_BASE_URL", "").strip()
 
 
+def _runtime_python_missing() -> bool:
+    """Local mode, and SessionStart recorded that no Python 3.10+ exists for the
+    Cognee server. Marker-only (no probing): the hook that tried is the authority."""
+    if _active_mode() != "local":
+        return False
+    try:
+        return _HOST_PYTHON_MARKER.is_file()
+    except OSError:
+        return False
+
+
 def _status_prefix(session_id: str = "") -> str:
     """The single left glyph slot shared by the server- and LLM-key signals.
 
@@ -808,6 +826,8 @@ def _status_prefix(session_id: str = "") -> str:
     contradictory:
       0. forced cloud with no URL configured: a misconfiguration this renderer
          can prove on its own — the precise reason beats any marker-derived one
+         (likewise local mode with no Python 3.10+ for the Cognee server,
+         recorded by SessionStart: ``cognee_needs_python_3_10``)
       1. a server-connection failure wins: if we can't reach or authenticate
          against the server, its LLM key is not the actionable problem
       2. otherwise an LLM-key failure, which *replaces* the green ● (the
@@ -816,6 +836,8 @@ def _status_prefix(session_id: str = "") -> str:
     """
     if _forced_cloud_unconfigured():
         return _fail_glyph(_MISSING_URL_REASON)
+    if _runtime_python_missing():
+        return _fail_glyph(_PYTHON_REQUIRED_REASON)
     server = _health_prefix(session_id)
     # Membership, not startswith: the glyph is now preceded by its colour escape.
     if "✕" in server:
