@@ -2216,7 +2216,7 @@ def _apply_update_nudge(output: dict) -> dict:
     via ``notified_version``) so it never nags, and auto-stops once updated.
     """
     try:
-        from _plugin_common import mark_update_notified, read_update_status
+        from _plugin_common import installed_plugin_id, mark_update_notified, read_update_status
 
         status = read_update_status()
     except Exception:
@@ -2228,9 +2228,15 @@ def _apply_update_nudge(output: dict) -> dict:
     if not (installed and latest) or status.get("notified_version") == latest:
         return output
 
+    # The id must match the marketplace the user installed from, or the
+    # suggested command fails with "plugin not found".
+    try:
+        plugin_id = installed_plugin_id()
+    except Exception:
+        plugin_id = "cognee-memory@cognee"
     message = (
         f"Cognee update available {installed} → {latest} — run "
-        "`/plugin update cognee-memory@cognee` (or enable marketplace auto-update)."
+        f"`/plugin update {plugin_id}` (or enable marketplace auto-update)."
     )
     result = dict(output or {})
     hso = dict(result.get("hookSpecificOutput") or {})

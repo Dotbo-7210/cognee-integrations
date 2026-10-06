@@ -10,6 +10,28 @@ Code only offers an update when that string changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.6]
+
+### Fixed
+- **The status bar vanished for installs from the official plugin directory.** The
+  renderer's self-eviction check looked for the exact key `cognee-memory@cognee` in
+  `enabledPlugins`. An install from the Anthropic plugin directory is registered as
+  `cognee-memory@anthropic-plugin-directory` instead, so the check never found its
+  key, concluded the plugin was disabled, and deleted its own `statusLine` entry on
+  the first refresh after every SessionStart re-added it — the bar flashed once per
+  session and then disappeared. The check now matches any `cognee-memory@<marketplace>`
+  key and treats the plugin as enabled when any of them is truthy.
+- **The update nudge named the wrong marketplace.** The SessionStart "update
+  available" message always suggested `/plugin update cognee-memory@cognee`, which
+  Claude Code rejects for a directory install. It now reads the id the install is
+  actually registered under from `installed_plugins.json` (newest version wins when
+  both marketplaces are present) and falls back to the repo marketplace id.
+- **`cognee-doctor.sh` ships executable.** Every released version up to 1.6.5 carried
+  the wrapper with mode 644, so the skills' `"${CLAUDE_PLUGIN_ROOT}/scripts/cognee-doctor.sh"`
+  failed with "permission denied" on every install channel (the mode bit was fixed on
+  `main` after 1.6.5 was cut; this is the first release that includes it). The other
+  wrappers were already 755.
+
 ## [1.6.5]
 
 ### Changed

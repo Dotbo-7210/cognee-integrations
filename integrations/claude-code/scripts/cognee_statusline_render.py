@@ -125,7 +125,15 @@ def _credits_age_hint(age_seconds: float) -> str:
 # any settings scope; if not, we remove our own statusLine entry and render
 # nothing. SessionStart re-adds it whenever the plugin is genuinely active, so a
 # transient mismatch self-heals on the next launch.
-_PLUGIN_ID = "cognee-memory@cognee"
+#
+# The enabledPlugins key is ``<plugin>@<marketplace>``, and the marketplace half
+# depends on where the user installed from: ``cognee-memory@cognee`` from this
+# repo's own marketplace, ``cognee-memory@anthropic-plugin-directory`` from the
+# official directory. Matching the exact id of one marketplace made the renderer
+# evict its own bar for every install from the other, so we match on the plugin
+# name and accept any marketplace.
+_PLUGIN_NAME = "cognee-memory"
+_PLUGIN_KEY_PREFIX = _PLUGIN_NAME + "@"
 _USER_SETTINGS = Path.home() / ".claude" / "settings.json"
 # A statusLine we consider "ours" to evict — never touch a user's own line.
 _OWNED_STATUSLINE_MARKER = "cognee-statusline"
@@ -490,7 +498,7 @@ def _recorded_install_version() -> str:
         return ""
     best, best_str = (), ""
     for key, installs in plugins.items():
-        if str(key).split("@", 1)[0] != "cognee-memory":
+        if str(key).split("@", 1)[0] != _PLUGIN_NAME:
             continue
         for install in installs if isinstance(installs, list) else []:
             version = str(install.get("version") or "") if isinstance(install, dict) else ""
@@ -509,12 +517,16 @@ def _read_json(path: Path) -> dict:
 
 
 def _enabled_in(path: Path):
-    """Tri-state: True/False if the plugin key is present in this settings file,
-    else None when the key is absent (file missing or no such entry)."""
+    """Tri-state: True if any ``cognee-memory@<marketplace>`` key in this
+    settings file is truthy, False if such keys exist but are all falsy, else
+    None when no such key is present (file missing or no such entry)."""
     enabled = _read_json(path).get("enabledPlugins")
-    if isinstance(enabled, dict) and _PLUGIN_ID in enabled:
-        return bool(enabled[_PLUGIN_ID])
-    return None
+    if not isinstance(enabled, dict):
+        return None
+    matches = [v for k, v in enabled.items() if str(k).startswith(_PLUGIN_KEY_PREFIX)]
+    if not matches:
+        return None
+    return any(bool(v) for v in matches)
 
 
 def _plugin_enabled(cwd: str) -> bool:

@@ -4259,6 +4259,44 @@ def _recorded_install_version() -> str:
     return best_str
 
 
+_UPDATE_DEFAULT_PLUGIN_ID = _UPDATE_PLUGIN_ENTRY + "@cognee"
+
+
+def installed_plugin_id() -> str:
+    """The ``<plugin>@<marketplace>`` id this install is registered under.
+
+    The marketplace half depends on where the user installed from
+    (``cognee-memory@cognee`` from this repo's marketplace,
+    ``cognee-memory@anthropic-plugin-directory`` from the official directory),
+    and ``/plugin update`` only accepts the id the install is actually
+    registered under. Reads Claude Code's install registry; when several
+    marketplaces have an entry, prefers the one holding the newest version.
+    Falls back to the repo marketplace id when the registry is missing or
+    has no cognee-memory entry.
+    """
+    try:
+        data = json.loads(_INSTALLED_PLUGINS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return _UPDATE_DEFAULT_PLUGIN_ID
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    if not isinstance(plugins, dict):
+        return _UPDATE_DEFAULT_PLUGIN_ID
+    best_key, best = "", ()
+    for key, installs in plugins.items():
+        name, sep, marketplace = str(key).partition("@")
+        if name != _UPDATE_PLUGIN_ENTRY or not sep or not marketplace:
+            continue
+        newest = ()
+        for install in installs if isinstance(installs, list) else []:
+            version = str(install.get("version") or "") if isinstance(install, dict) else ""
+            parsed = _parse_semver(version)
+            if parsed and parsed > newest:
+                newest = parsed
+        if not best_key or newest > best:
+            best_key, best = str(key), newest
+    return best_key or _UPDATE_DEFAULT_PLUGIN_ID
+
+
 def _update_source() -> Optional[tuple]:
     """Return (repo, ref) to read the published version from, or None to skip.
 
