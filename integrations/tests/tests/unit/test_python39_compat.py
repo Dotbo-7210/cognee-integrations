@@ -75,10 +75,12 @@ def test_every_script_parses_on_39_and_defers_annotations(suite):
 @pytest.fixture
 def ss(suite, hook_module, monkeypatch):
     module = hook_module(suite, "session-start.py")
-    # No uv anywhere, and no network to fetch it: the only remaining install
-    # path is the stdlib venv built from the host interpreter.
+    # No uv anywhere (the plugin never fetches one): the only remaining install
+    # path is the stdlib venv built from a host interpreter.
     monkeypatch.setattr(module, "_find_uv", lambda: "")
-    monkeypatch.setattr(module, "_install_uv", lambda: "")
+    # And no other python3.x on PATH either: the fallback must judge the host
+    # interpreter alone (it probes PATH before refusing).
+    monkeypatch.setattr(module.shutil, "which", lambda name, *a, **k: None)
     return module
 
 
