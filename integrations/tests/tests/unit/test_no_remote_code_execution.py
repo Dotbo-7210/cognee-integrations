@@ -102,6 +102,41 @@ def test_fallback_uses_newer_python_from_path_when_host_is_old(suite, ss, temp_h
     assert not ss._HOST_PYTHON_MARKER.exists()
 
 
+def test_fallback_skips_python_newer_than_cognee_supports(suite, ss, temp_home, monkeypatch):
+    """The range is bounded above as well: cognee's wheels refuse a Python past
+    3.14, so a 3.15 host is skipped and a 3.12 on PATH is preferred."""
+    monkeypatch.setattr(ss, "_find_uv", lambda: "")
+    monkeypatch.setattr(sys, "version_info", (3, 15, 0, "final", 0))
+    fake = "/opt/homebrew/bin/python3.12"
+    monkeypatch.setattr(
+        ss.shutil, "which", lambda name, *a, **k: fake if name == "python3.12" else None
+    )
+    monkeypatch.setattr(
+        ss, "_host_python_version", lambda python: (3, 12) if python == fake else ()
+    )
+    calls: list[list[str]] = []
+
+    def _record(cmd, *args, **kwargs):
+        calls.append([str(c) for c in cmd])
+        raise OSError("hermetic")
+
+    monkeypatch.setattr(ss.subprocess, "run", _record)
+    assert ss.ensure_cognee_installed() is False
+    assert calls and calls[0][:3] == [fake, "-m", "venv"], calls
+
+
+def test_fallback_refuses_when_only_a_too_new_python_exists(suite, ss, temp_home, monkeypatch):
+    monkeypatch.setattr(ss, "_find_uv", lambda: "")
+    monkeypatch.setattr(sys, "version_info", (3, 15, 0, "final", 0))
+    monkeypatch.setattr(ss.shutil, "which", lambda name, *a, **k: None)
+    monkeypatch.setattr(
+        ss.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no build"))
+    )
+    assert ss.ensure_cognee_installed() is False
+    assert ss._HOST_PYTHON_MARKER.exists()
+    assert ss._PINNED_PYTHON == ">=3.10,<3.15"  # uv is held to the same range
+
+
 def test_fallback_runs_when_uv_cannot_find_an_interpreter(suite, ss, monkeypatch):
     """uv present, nothing it may use: fall through to the stdlib venv, don't give up."""
     monkeypatch.setattr(ss, "_find_uv", lambda: "/fake/uv")

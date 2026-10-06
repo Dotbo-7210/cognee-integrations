@@ -118,13 +118,17 @@ _UV_BIN = _UV_DIR / ("uv.exe" if os.name == "nt" else "uv")
 # handed to uv as a *discovery* location so a machine that already has one keeps
 # using it; downloads themselves are disabled (UV_PYTHON_DOWNLOADS=never).
 _UV_PYTHON_DIR = _GLOBAL_STATE_DIR / "python"
+# The interpreter range cognee itself supports (its ``requires-python``): both
+# the uv request and the stdlib fallback are bounded by it, so a too-new Python
+# (which cognee's wheels would refuse) is skipped the same as a too-old one.
+_FALLBACK_VENV_MIN_PYTHON = (3, 10)
+_FALLBACK_VENV_MAX_PYTHON = (3, 14)
 # A version *range*, not a single minor: lets uv pick whichever cognee-compatible
 # interpreter is already installed instead of insisting on one it would have to
 # fetch. COGNEE_PLUGIN_PYTHON overrides it (a version, a name, or a path).
-_PINNED_PYTHON = os.environ.get("COGNEE_PLUGIN_PYTHON", "") or ">=3.10,<3.15"
-# Floor for the HOST interpreter the uv-less fallback builds the runtime venv
-# from (the venv inherits its version).
-_FALLBACK_VENV_MIN_PYTHON = (3, 10)
+_PINNED_PYTHON = os.environ.get("COGNEE_PLUGIN_PYTHON", "") or ">={}.{},<{}.{}".format(
+    *_FALLBACK_VENV_MIN_PYTHON, _FALLBACK_VENV_MAX_PYTHON[0], _FALLBACK_VENV_MAX_PYTHON[1] + 1
+)
 # Interpreter names probed on PATH for that fallback, newest first, when the
 # python3 that launched the hook is itself too old: macOS ships 3.9 as
 # /usr/bin/python3 while a Homebrew or python.org 3.12 sits beside it.
@@ -226,14 +230,22 @@ def _host_python_version(python: str) -> tuple:
         return ()
 
 
+def _cognee_supports(version: tuple) -> bool:
+    """Whether a ``(major, minor)`` falls inside cognee's supported range."""
+    if not version:
+        return False
+    return _FALLBACK_VENV_MIN_PYTHON <= tuple(version[:2]) <= _FALLBACK_VENV_MAX_PYTHON
+
+
 def _find_host_python() -> str:
-    """A Python >= 3.10 already installed on this machine, or '' when there is none.
+    """A Python inside cognee's supported range (3.10-3.14) already installed on
+    this machine, or '' when there is none.
 
     Used by the stdlib ``venv`` fallback. The interpreter running this hook is
     tried first (no subprocess), then the versioned names on PATH, newest first.
     Nothing is downloaded: a miss is reported by ``_refuse_fallback_venv``.
     """
-    if tuple(sys.version_info[:2]) >= _FALLBACK_VENV_MIN_PYTHON:
+    if _cognee_supports(tuple(sys.version_info[:2])):
         return sys.executable
     seen = {sys.executable}
     for name in _HOST_PYTHON_CANDIDATES:
@@ -241,8 +253,7 @@ def _find_host_python() -> str:
         if not found or found in seen:
             continue
         seen.add(found)
-        version = _host_python_version(found)
-        if version and version >= _FALLBACK_VENV_MIN_PYTHON:
+        if _cognee_supports(_host_python_version(found)):
             return found
     return ""
 
@@ -271,6 +282,7 @@ def _refuse_fallback_venv() -> None:
         "python": sys.executable,
         "version": "{}.{}.{}".format(*sys.version_info[:3]),
         "required": "{}.{}".format(*_FALLBACK_VENV_MIN_PYTHON),
+        "supported": "{}.{}-{}.{}".format(*_FALLBACK_VENV_MIN_PYTHON, *_FALLBACK_VENV_MAX_PYTHON),
     }
     hook_log("host_python_too_old_for_venv", detail)
     print(message, file=sys.stderr)

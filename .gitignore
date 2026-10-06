@@ -108,3 +108,7 @@ integrations/openclaw/reports/
 # Local cognee databases (created when running examples/workflows locally)
 .cognee_system/
 .cognee_data/
+
+# Local OpenClaw agent workspaces created when running a gateway from this checkout
+integrations/openclaw/.openclaw/
+integrations/openclaw/openclaw-agent-*/

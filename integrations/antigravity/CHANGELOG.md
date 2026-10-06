@@ -24,7 +24,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
   venv from `sys.executable` and refused when that was older than 3.10 — on macOS that
   is `/usr/bin/python3` 3.9.6, even with a Homebrew 3.12 beside it. It now probes
   `python3.14` … `python3.10`, `python3`, `python` on PATH, newest first, and uses the
-  first that is 3.10 or newer. If uv is present but finds no suitable interpreter, the
+  first inside cognee's supported range (3.10–3.14; a newer Python is skipped too). If uv is present but finds no suitable interpreter, the
   same fallback runs instead of giving up.
 - **Local mode has a stated prerequisite: a Python 3.10–3.14 installed on the machine.**
   The hooks themselves still run on 3.9+. Machines with only the macOS 3.9.6 and no uv
