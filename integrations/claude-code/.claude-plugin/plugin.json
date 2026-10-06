@@ -1,5 +1,6 @@
 {
   "name": "cognee-memory",
+  "displayName": "Cognee Memory",
   "description": "Cognee knowledge graph memory for Claude Code — session-aware storage, auto-routing recall, and persistent learning across sessions. Supports local mode and Cognee Cloud.",
   "version": "1.6.5",
   "author": {
@@ -8,5 +9,10 @@
   },
   "homepage": "https://docs.cognee.ai",
   "repository": "https://github.com/topoteretes/cognee-integrations",
+  "license": "Apache-2.0",
+  "privacyPolicyUrl": "https://www.cognee.ai/privacy-notice",
+  "documentationUrl": "https://github.com/topoteretes/cognee-integrations/tree/main/integrations/claude-code#readme",
+  "supportUrl": "https://github.com/topoteretes/cognee-integrations/issues",
+  "icon": "./icon.png",
   "keywords": ["memory", "knowledge-graph", "cognee", "reasoning", "session"]
 }

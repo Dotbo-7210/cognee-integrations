@@ -19,6 +19,65 @@ The integration:
 - injects relevant context on prompt submit
 - syncs session memory into graph memory on session end/final exit
 
+## What this plugin runs, stores and sends
+
+Everything below is the plugin's own readable Python and shell under this folder; it
+runs no code from anywhere else.
+
+**Captured.** Your prompts, the tool calls Claude makes (name, arguments and output,
+filtered by the [capture controls](#automatic-capture-controls)), and Claude's
+answers, plus a short memory anchor before compaction. Credentials, private keys and
+database URLs are redacted before anything is stored or uploaded, and `.env`,
+credential and key files are never captured. `COGNEE_CAPTURE=false` turns automatic
+capture off; recall and explicit remember keep working.
+
+**Where it goes.** To the Cognee server you configure, and nowhere else.
+- *Local mode* (default): a cognee server the plugin starts on this machine, bound
+  to `localhost:8011`. Memory is stored on this machine. To build the graph, that
+  server sends captured text to the LLM and embedding provider you configured
+  (`LLM_API_KEY`, `LLM_PROVIDER`), or to Claude Code through the observer below.
+- *Cloud mode*: your Cognee Cloud instance at `COGNEE_BASE_URL`, over HTTPS,
+  authenticated with your `COGNEE_API_KEY`. The status line's credit balance comes
+  from the Cognee platform API (`api.aws.cognee.ai`).
+
+Memory is kept until you delete it (the `cognee-forget` skill, or deleting the
+dataset). The plugin never expires server-side memory on its own.
+
+**Other network calls.** Local mode installs `cognee==1.6.1` from PyPI into
+`~/.cognee-plugin/venv` once. The background idle watcher fetches this repository's
+`marketplace.json` from `raw.githubusercontent.com` at most hourly to offer updates
+(`COGNEE_UPDATE_CHECK=off`). No telemetry, no analytics: nothing is sent to
+Anthropic, Cognee or any third party beyond the calls above.
+
+**Stored locally.** `~/.cognee-plugin/claude-code/` (logs, status markers, buffered
+turns, swept automatically; see [Logs and state](#logs-and-state)),
+`~/.cognee-plugin/venv/`, `~/.cognee-plugin/api_key.json`, and your settings in
+`~/.cognee/.env`.
+
+**Settings it writes.** One `statusLine` entry in `~/.claude/settings.json`, pointing
+at the plugin's own renderer, so the memory status shows in Claude Code's status
+line. `COGNEE_STATUSLINE=false` skips it; the renderer removes its own entry when
+the plugin is gone. Nothing else in your Claude Code settings is touched.
+
+**Claude's own files.** The plugin reads the hook payloads Claude Code sends it, not
+your transcript or Claude Code's memory files, and writes to neither.
+
+**Background processes.** Detached helpers that outlive a hook: the idle watcher and
+exit watcher (session sync and status), and in local mode the cognee server and,
+when enabled, the Claude observer shim. All are scripts from this folder.
+
+**Credentials it reads.** `COGNEE_API_KEY`, `COGNEE_BASE_URL` and `LLM_API_KEY` from
+`~/.cognee/.env` or the environment. The API key goes only to the Cognee server you
+configured; the LLM key only to the local server's process.
+
+**Your Claude subscription.** In local mode with no `LLM_API_KEY` set and the
+`claude` CLI on PATH, the server's own LLM calls (cognify, improve) run as
+`claude -p --safe-mode` under your Claude Code login and count against your
+subscription usage. Your login is passed only to that child process, never to any
+server. Session start says so every time it is in use;
+`COGNEE_LLM_OBSERVER=false` turns it off. Details under
+[Claude observer](#claude-observer-local-mode-on-your-claude-subscription).
+
 ## Install
 
 **Requirements.** Any Python 3.9 or newer available as `python3` (or `python`) on PATH runs the hooks — they are stdlib-only HTTP clients and never import cognee, so the Python 3.9.6 that ships with macOS's Xcode Command Line Tools is enough for them. **Local mode additionally needs a Python 3.10–3.14 installed on the machine** (python.org, Homebrew, pyenv, or `uv python install 3.12`): the plugin builds its own virtualenv for the Cognee server under `~/.cognee-plugin/venv` from an interpreter it finds, and installs exactly `cognee==<pinned version>` into it. The plugin never downloads installers or interpreters — it uses [uv](https://docs.astral.sh/uv/) if you already have it (with interpreter downloads disabled), otherwise the stdlib `venv` + pip with the newest `python3.x` it finds on PATH. If no 3.10+ interpreter exists it refuses, logs `host_python_too_old_for_venv` to `hook.log`, and every session start says so until one is installed. Cloud mode never builds a runtime. (SDK-based integrations such as LangGraph or CrewAI import cognee in-process and need Python 3.10+; see [`CONFIGURATION.md`](../CONFIGURATION.md#python-version-requirements).)
@@ -310,7 +369,7 @@ hint meanwhile, so a loaded server costs one listing timeout per window, not one
 | `UserPromptSubmit` | dataset-scoped context lookup + async prompt staging |
 | `PreToolUse` (`Read`) | [file-scoped context](#file-context-on-read): code-graph facts about the file about to be read, injected as `additionalContext` |
 | `PostToolUse` | async trace write |
-| `Stop` | assistant answer write + optional transcript clear hook |
+| `Stop` | assistant answer write + credits refresh |
 | `PreCompact` | memory anchor build before compaction |
 | `SessionEnd` | trigger detached final sync worker |
 
@@ -710,16 +769,6 @@ The status line reads only local state — no network calls on every refresh:
 5. LLM key: `llm-state/<session>.json`, then `llm-state.json`
 6. Counts: `recall/<session>.json`, then `last_recall.json`
 
-## Auto-clear demo hook
-
-For demo flows where each response should clear local transcript context:
-
-```bash
-export COGNEE_CLAUDE_CLEAR_AFTER_MESSAGE=true
-```
-
-This clears the transcript file on `Stop` after memory capture.
-
 ## Logs and state
 
 Claude Code-specific plugin state and logs are written under:
@@ -934,7 +983,6 @@ Keys are letters, digits, and underscores. Values are taken literally — no `$V
 | plugin-only mode switch | `COGNEE_CLAUDE_BACKEND` | unset | Same, for this plugin only; beats `COGNEE_BACKEND` |
 | local URL override | `COGNEE_LOCAL_API_URL` | `http://localhost:8011` | Local API base URL |
 | local LLM | `LLM_API_KEY`, `LLM_MODEL` | unset | Required for local mode runtime |
-| demo auto-clear | `COGNEE_CLAUDE_CLEAR_AFTER_MESSAGE` | disabled | Clear transcript on Stop after capture |
 | idle watcher poll | `COGNEE_IDLE_POLL` | `10` | Idle watcher poll interval in seconds |
 | idle watcher threshold | `COGNEE_IDLE_THRESHOLD` | `60` | Seconds of inactivity before idle improve fires |
 | improve cooldown | `COGNEE_IMPROVE_COOLDOWN` | `5400` | Minimum seconds between automatic (idle/auto) improves of one session |
