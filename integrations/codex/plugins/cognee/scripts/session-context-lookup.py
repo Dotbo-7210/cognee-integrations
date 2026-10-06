@@ -298,7 +298,7 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
     # so a confirmed-bad backend costs one bounded probe per prompt instead of
     # the full budget.
     service_url = runtime.get("base_url", "")
-    probe_timeout = _float_env("COGNEE_READY_PROBE_TIMEOUT", 1.0)
+    probe_timeout = _float_env("COGNEE_READY_PROBE_TIMEOUT", 3.0)
     prior = read_connection_state()
     # Permissive on purpose: "same target" unless the two URLs provably differ,
     # so a recorded state still applies when a URL is unknown. Mirrors the
@@ -414,11 +414,11 @@ async def _run(prompt: str, cwd: str = "") -> dict | None:
     # very same interval. COGNEE_RECALL_TIMEOUT is NOT read here — it still
     # bounds the explicit cognee-search path (_cognee_client.py).
     #
-    # The default (12s) is sized for the graph scope, the only expensive call.
+    # The default (20s) is sized for the graph scope, the only expensive call.
     # Graph search time grows with the dataset and with the round trip to a
     # remote (cloud) server, so a cap tuned for a small local graph silently
     # drops graph memory once either grows.
-    recall_budget = _float_env("COGNEE_RECALL_BUDGET", 12.0)
+    recall_budget = _float_env("COGNEE_RECALL_BUDGET", 20.0)
     recall_start = time.monotonic()
     budget_deadline = recall_start + recall_budget
     # Respect the shared circuit breaker: when the server has been failing (tripped

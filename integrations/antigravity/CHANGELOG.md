@@ -32,6 +32,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
   `host_python_too_old_for_venv` refusal at every session start, reworded to name the
   interpreters checked and how to install one, until a 3.10+ Python exists. Cloud mode
   is unaffected. README and `CONFIGURATION.md` updated accordingly.
+- **Per-prompt readiness probe sized for a loaded cloud tenant.** Gateway logs from a
+  production tenant showed half of the 1 s readiness probes timing out against a
+  server whose normal answer takes 0.3 s. `COGNEE_READY_PROBE_TIMEOUT` is now `3.0`
+  (was `1.0`). A ceiling, not a cost: a fast server answers exactly as before.
+- **Idle/auto improves of one session run at most every 90 minutes.**
+  `COGNEE_IMPROVE_COOLDOWN` defaults to `5400` (was `1800`). The session-end final
+  sync ignores the cooldown as before.
 
 ### Added
 - **The missing-interpreter case is now visible in three places, and names the cause.**
