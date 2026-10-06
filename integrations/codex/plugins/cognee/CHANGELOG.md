@@ -10,6 +10,77 @@ is the cache key and semver record, bumped on each release, not the update trigg
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.5]
+
+### Changed
+- **Local mode no longer downloads anything but the pinned `cognee` package.** Plugin
+  directories admit only code that is in the reviewed repository or a
+  package pinned to an exact version, and the bootstrap broke that rule twice: when uv
+  was missing it ran `curl https://astral.sh/uv/install.sh | sh`, and it let uv fetch a
+  standalone Python 3.12 from GitHub when none was installed. Both are gone.
+  `session-start.py` now builds the runtime venv only from tooling already on the
+  machine: an existing uv (invoked with `UV_PYTHON_DOWNLOADS=never` and a `>=3.10,<3.15`
+  interpreter request, so it picks whatever compatible Python is installed instead of
+  one it would have to download), otherwise the stdlib `venv` + pip. The only network
+  install left is `cognee==1.6.1` from PyPI.
+- **The stdlib fallback looks past the hook's own interpreter.** Previously it built the
+  venv from `sys.executable` and refused when that was older than 3.10 — on macOS that
+  is `/usr/bin/python3` 3.9.6, even with a Homebrew 3.12 beside it. It now probes
+  `python3.14` … `python3.10`, `python3`, `python` on PATH, newest first, and uses the
+  first inside cognee's supported range (3.10–3.14; a newer Python is skipped too). If uv is present but finds no suitable interpreter, the
+  same fallback runs instead of giving up.
+- **Local mode has a stated prerequisite: a Python 3.10–3.14 installed on the machine.**
+  The hooks themselves still run on 3.9+. Machines with only the macOS 3.9.6 and no uv
+  used to be zero-setup through the downloaded interpreter; they now get the existing
+  `host_python_too_old_for_venv` refusal at every session start, reworded to name the
+  interpreters checked and how to install one, until a 3.10+ Python exists. Cloud mode
+  is unaffected. README and `CONFIGURATION.md` updated accordingly.
+- **Per-prompt timeouts sized for a loaded cloud tenant.** Gateway logs from a
+  production tenant showed the plugin giving up on requests the server would have
+  answered: half of the readiness probes past 1 s, two thirds of recalls past 12 s,
+  with normal completions at 0.3 s and 8 s. The defaults were tuned for localhost.
+  `COGNEE_READY_PROBE_TIMEOUT` is now `3.0` (was `1.0`) and `COGNEE_RECALL_BUDGET`
+  is `20` (was `12`). Ceilings, not costs: a fast server answers exactly as before,
+  a slow one stops producing empty recalls and false "not responding" verdicts.
+- **Idle/auto improves of one session run at most every 90 minutes.**
+  `COGNEE_IMPROVE_COOLDOWN` defaults to `5400` (was `1800`). The session-end final
+  sync, the explicit sync skill and the dataset-switch sync still ignore the
+  cooldown.
+
+### Added
+- **The missing-interpreter case is now visible in three places, and names the cause.**
+  The session-start message opens with *"Cognee requires Python 3.10 or newer (up to
+  3.14), and no such interpreter is installed on this machine"*, lists what was
+  checked, and says cloud mode is exempt. The status line shows
+  `✕ (cognee_needs_python_3_10)` — proven from the SessionStart marker like
+  `missing_cognee_base_url`, so it appears at once rather than as a misleading
+  `unreachable`. `doctor.py` gained a `Runtime Python` row: the venv's interpreter once
+  built, otherwise the 3.10+ interpreter the next session start will use, otherwise
+  `MISSING - Cognee needs Python 3.10-3.14`. All three clear on the first session after
+  an interpreter is installed.
+
+### Fixed
+- **Warm-up buffer mutex lost an append on Windows.** `_buffer_lock` treated a
+  `PermissionError` from `O_CREAT|O_EXCL` as a broken lock and fell open without it.
+  On Windows that error is what a lock file in the *delete-pending* window answers
+  with (the holder unlinked it while another waiter still had a stat handle on it), so
+  under contention one writer skipped the mutex and clobbered another's entry — the
+  `test_concurrent_appends_do_not_lose_entries` failure on the Windows CI runner. It is
+  now treated as a busy signal and retried until the existing deadline.
+- **The dataset hint no longer re-pays a failed listing on every prompt.** The
+  readable-datasets listing behind the hint was served from a five-minute cache,
+  but a refresh that failed left the cache stale and was retried on the next
+  eligible prompt, each attempt paying the full 2 s timeout — on a tenant where
+  that call times out most of the time, most hint-bearing prompts did. A failed
+  refresh is now recorded and the stale rows (or nothing) serve the hint without a
+  network call for `COGNEE_DATASETS_CACHE_RETRY` seconds (default `120`); a
+  successful refresh clears it. The backoff is per server and identity, like the
+  cache itself. New hook event `readable_datasets_refresh_deferred`.
+
+### Removed
+- `_install_uv()` and the `https://astral.sh/uv/install.sh` constant. uv found under
+  `~/.cognee-plugin/uv` from an earlier plugin version, or on PATH, is still used.
+
 ## [1.7.4]
 
 ### Added

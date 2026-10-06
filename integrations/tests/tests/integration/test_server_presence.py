@@ -260,7 +260,6 @@ def test_install_runs_when_venv_holds_another_version(session_start, monkeypatch
     versions = iter(["1.0.0", pin])  # before the install / after it
     monkeypatch.setattr(session_start, "_venv_cognee_version", lambda: next(versions))
     monkeypatch.setattr(session_start, "_find_uv", lambda: "/fake/uv")
-    monkeypatch.setattr(session_start, "_install_uv", lambda: None)
     runs: list[list[str]] = []
 
     def record(argv, **kwargs):

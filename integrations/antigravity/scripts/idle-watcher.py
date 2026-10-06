@@ -31,7 +31,7 @@ from event_names import event_fields
 
 # Tunable via env. Defaults chosen to avoid thrashing the LLM: 60s idle
 # threshold means you have to actively pause a full minute. The improve cooldown
-# (COGNEE_IMPROVE_COOLDOWN, 30 minutes) is deliberately NOT a variable here: this
+# (COGNEE_IMPROVE_COOLDOWN, 90 minutes) is deliberately NOT a variable here: this
 # process exits after one bridge and is respawned on the next prompt, so a
 # process-local timestamp reset every turn and the cooldown never gated
 # anything. It lives in the per-session improve state instead

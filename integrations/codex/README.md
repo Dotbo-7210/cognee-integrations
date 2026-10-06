@@ -23,7 +23,9 @@ The integration:
 
 ## Install
 
-**Requirements.** Any Python 3.9 or newer available as `python3` (or `python`) on PATH — the hooks are stdlib-only HTTP clients and never import cognee, so the Python 3.9.6 that ships with macOS's Xcode Command Line Tools is enough. In local mode the plugin brings its own runtime for the Cognee server: it fetches [uv](https://docs.astral.sh/uv/) into `~/.cognee-plugin/uv` and builds a Python 3.12 virtualenv with it (reusing a 3.12 already on the machine, otherwise downloading a ~66 MB standalone build). Only when uv is absent *and* cannot be downloaded does the plugin fall back to the host interpreter, and that fallback needs Python 3.10 or newer: on an older host it refuses, logs `host_python_too_old_for_venv` to `hook.log`, and every session start says so until uv or a newer python3 is installed. Cloud mode never builds a runtime. (SDK-based integrations such as LangGraph or CrewAI import cognee in-process and need Python 3.10+; see [`CONFIGURATION.md`](../CONFIGURATION.md#python-version-requirements).)
+**Requirements.** Any Python 3.9 or newer available as `python3` (or `python`) on PATH runs the hooks — they are stdlib-only HTTP clients and never import cognee, so the Python 3.9.6 that ships with macOS's Xcode Command Line Tools is enough for them. **Local mode additionally needs a Python 3.10–3.14 installed on the machine** (python.org, Homebrew, pyenv, or `uv python install 3.12`): the plugin builds its own virtualenv for the Cognee server under `~/.cognee-plugin/venv` from an interpreter it finds, and installs exactly `cognee==<pinned version>` into it. The plugin never downloads installers or interpreters — it uses [uv](https://docs.astral.sh/uv/) if you already have it (with interpreter downloads disabled), otherwise the stdlib `venv` + pip with the newest `python3.x` it finds on PATH. If no 3.10+ interpreter exists it refuses, logs `host_python_too_old_for_venv` to `hook.log`, and every session start says so until one is installed. Cloud mode never builds a runtime. (SDK-based integrations such as LangGraph or CrewAI import cognee in-process and need Python 3.10+; see [`CONFIGURATION.md`](../CONFIGURATION.md#python-version-requirements).)
+
+**If local mode refuses to start.** A session that opens with *"Cognee requires Python 3.10 or newer (up to 3.14), and no such interpreter is installed on this machine"* means exactly that: the hooks ran (they only need 3.9), but the Cognee server has nothing to run on, and the plugin will not download an interpreter. The status line shows `✕ (cognee_needs_python_3_10)` and `doctor.py` reports `Runtime Python: MISSING` until you install one (`brew install python@3.12`, python.org, pyenv, or `uv python install 3.12`) and start a new session — nothing else to configure. Cloud mode has no such requirement.
 
 Install via the Codex marketplace. First enable hooks, then run the install commands in your terminal or directly inside a Codex session.
 
@@ -310,12 +312,15 @@ keeps the full scope. Datasets are addressed by UUID because a name only resolve
 datasets your identity owns. The listing behind the hint is cached per plugin
 (`~/.cognee-plugin/codex/readable-datasets.json`) and refreshed at most every
 `COGNEE_DATASETS_CACHE_TTL` seconds (default `300`), inside what is left of the recall budget,
-so the prompt path never waits on it.
+so the prompt path never waits on it. A refresh that fails (timeout, unreachable) is not
+retried for `COGNEE_DATASETS_CACHE_RETRY` seconds (default `120`): the stale rows serve the
+hint meanwhile, so a loaded server costs one listing timeout per window, not one per prompt.
 
 | Env var | Default | Effect |
 |---|---|---|
 | `COGNEE_RECALL_DATASET_HINT` | `on` | Set `off` to stop the prompt hook from naming the other datasets. On, the block is injected once per session (the first prompt the server answered) and again on any prompt memory answered with nothing. The explicit skill flow is unaffected. |
 | `COGNEE_DATASETS_CACHE_TTL` | `300` | Seconds the cached readable-datasets listing is served before one bounded refresh. |
+| `COGNEE_DATASETS_CACHE_RETRY` | `120` | Seconds after a failed refresh before the listing is fetched again; the stale rows are served meanwhile. |
 
 ## Recaps: standup, digest, timeline
 
@@ -388,7 +393,7 @@ A **failed** attempt arms the same window as a **backoff**: if the submit timed 
 |---|---|---|
 | `COGNEE_IDLE_POLL` | `10` | Poll interval in seconds |
 | `COGNEE_IDLE_THRESHOLD` | `60` | Seconds of inactivity before idle improve fires |
-| `COGNEE_IMPROVE_COOLDOWN` | `1800` | Minimum seconds between automatic (idle/auto) improves of one session; persisted per session |
+| `COGNEE_IMPROVE_COOLDOWN` | `5400` | Minimum seconds between automatic (idle/auto) improves of one session; persisted per session |
 | `COGNEE_AUTO_IMPROVE_EVERY` | `150` | Stored tool calls/stops between automatic improves (`0` disables) |
 | `COGNEE_IMPROVE_SUBMIT_TIMEOUT` | `420` | Read timeout for the improve POST (agent-context extraction and distillation run inside the request) |
 
@@ -470,11 +475,11 @@ cognee: my-project · cloud
 
 `<dataset>` is the active Cognee dataset. `<mode>` is `local` when no `COGNEE_BASE_URL` is set or when it points to localhost, and `cloud` when it points to a remote host; an exported `COGNEE_BACKEND` / `COGNEE_CODEX_BACKEND` switch overrides that, so the status always shows the mode the terminal actually resolved.
 
-A connection glyph precedes the line: `●` once the server is confirmed up **and** authenticated, or `✕ (<reason>)` on failure — `incorrect_cognee_api_key` (a missing, wrong, or expired `COGNEE_API_KEY`), `unreachable` (server positively absent: connection refused or DNS failure, including a server that dies mid-session), `server_error` (5xx), `not_responding` (the server accepts connections but hasn't answered for several consecutive prompts — a single slow response never triggers it, so a busy server is not misreported as unreachable), or `missing_cognee_base_url` (the terminal was pinned to cloud with the `COGNEE_BACKEND` switch but no `COGNEE_BASE_URL` is configured anywhere — a misconfiguration proven directly from the environment and shown immediately, not after a failed connection attempt). The state is recorded by the hooks that already talk to the server (SessionStart, and the per-prompt recall), so it stays green until a failure is actually observed and clears back to `●` on the next success. Read from local state only — no network on refresh.
+A connection glyph precedes the line: `●` once the server is confirmed up **and** authenticated, or `✕ (<reason>)` on failure — `incorrect_cognee_api_key` (a missing, wrong, or expired `COGNEE_API_KEY`), `unreachable` (server positively absent: connection refused or DNS failure, including a server that dies mid-session), `server_error` (5xx), `not_responding` (the server accepts connections but hasn't answered for several consecutive prompts — a single slow response never triggers it, so a busy server is not misreported as unreachable), `missing_cognee_base_url` (the terminal was pinned to cloud with the `COGNEE_BACKEND` switch but no `COGNEE_BASE_URL` is configured anywhere — a misconfiguration proven directly from the environment and shown immediately, not after a failed connection attempt), or `cognee_needs_python_3_10` (local mode, and the last session start found no Python 3.10–3.14 for the Cognee server to run on; the plugin does not download one — install an interpreter and start a new session). The state is recorded by the hooks that already talk to the server (SessionStart, and the per-prompt recall), so it stays green until a failure is actually observed and clears back to `●` on the next success. Read from local state only — no network on refresh.
 
 | Env var | Default | Effect |
 |---|---|---|
-| `COGNEE_READY_PROBE_TIMEOUT` | `1.0` | Seconds the per-prompt readiness probe waits before giving up and skipping recall for that turn. It sits on the keystroke→answer path, so the default is deliberately tight; raise it on a slow or loaded server that is otherwise healthy. |
+| `COGNEE_READY_PROBE_TIMEOUT` | `3.0` | Seconds the per-prompt readiness probe waits before giving up and skipping recall for that turn. It sits on the keystroke→answer path, so the default is deliberately tight; raise it on a slow or loaded server that is otherwise healthy. |
 
 In local mode the plugin also surfaces `LLM_API_KEY` problems (the key the local server uses to call the LLM) **in that same leading glyph slot**: `✕ (incorrect_llm_api_key) cognee: … · local` when the key is missing or the provider rejects it — one reason for both, since the fix is the same either way (`llm-state.json` still records which it was). The slot holds one sign, by precedence: a server-connection failure wins (if the server can't be reached or authenticated, its LLM key isn't the actionable problem), otherwise an LLM-key failure is shown **in place of** the `●` — the `llm_*` reason already tells you the server side itself is fine, so `●` and `✕` never appear together.
 
@@ -673,7 +678,7 @@ Keys are letters, digits, and underscores. Values are taken literally — no `$V
 | local LLM | `LLM_API_KEY`, `LLM_MODEL` | unset | Required for local mode runtime |
 | idle watcher poll | `COGNEE_IDLE_POLL` | `10` | Idle watcher poll interval in seconds |
 | idle watcher threshold | `COGNEE_IDLE_THRESHOLD` | `60` | Seconds of inactivity before idle improve fires |
-| improve cooldown | `COGNEE_IMPROVE_COOLDOWN` | `1800` | Minimum seconds between automatic (idle/auto) improves of one session |
+| improve cooldown | `COGNEE_IMPROVE_COOLDOWN` | `5400` | Minimum seconds between automatic (idle/auto) improves of one session |
 | auto-improve threshold | `COGNEE_AUTO_IMPROVE_EVERY` | `150` | Stored tool calls/stops between automatic improves (`0` disables) |
 | improve submit timeout | `COGNEE_IMPROVE_SUBMIT_TIMEOUT` | `420` | Read timeout for the improve POST |
 | recall minimum prompt length | `COGNEE_RECALL_MIN_PROMPT_CHARS` | `5` | Prompts shorter than this (surrounding whitespace not counted) skip the per-prompt recall. Values below `5` or non-numeric fall back to `5`. Capture is unaffected. |
@@ -684,7 +689,7 @@ Each operation has its own client timeout, tunable independently (all in seconds
 
 | Env var | Default | Effect |
 |---|---|---|
-| `COGNEE_RECALL_BUDGET` | `12` | Whole-recall deadline for the per-prompt lookup; a scope that overruns contributes no hits |
+| `COGNEE_RECALL_BUDGET` | `20` | Whole-recall deadline for the per-prompt lookup; a scope that overruns contributes no hits |
 | `COGNEE_RECALL_PASSAGE_CHARS` | `2000` | Per-passage cap on the retrieved context the prompt hook injects, cut at a paragraph break and marked with how much was cut; `0` disables. Bridged session chunks run 2k–20k chars each |
 | `COGNEE_RECALL_CONTEXT_CHARS` | `12000` | Soft budget for the whole injected memory block; passages are trimmed from the end (lowest ranked first) until it fits, entities and facts never; `0` disables |
 | `COGNEE_RECALL_TIMEOUT` | `120` | Client timeout for an explicit search (`cognee-search`); the per-prompt lookup uses `COGNEE_RECALL_BUDGET` instead |
@@ -710,6 +715,11 @@ Each operation has its own client timeout, tunable independently (all in seconds
 
 **No new behavior after local edits**
 - Codex may still be running a cached Git marketplace copy. Confirm installed marketplace/plugin source, then reinstall from the intended source.
+
+**Session start says "Cognee requires Python 3.10 or newer" / status shows `✕ (cognee_needs_python_3_10)`**
+- Local mode only. The hooks run on any Python 3.9+, but the Cognee server needs 3.10–3.14 and the plugin never downloads an interpreter — it builds its venv from one already installed (`python3.14` … `python3.10`, then `python3`, on PATH; or whatever uv can find if you have uv).
+- Install one (`brew install python@3.12`, python.org, pyenv, or `uv python install 3.12`) and start a new session; nothing to configure. `doctor.py` → `Runtime Python` shows which interpreter the plugin sees.
+- Relevant logs: `host_python_too_old_for_venv` (what was checked), then `cognee_install_ready` once a venv is built.
 
 **Startup / local endpoint issues**
 

@@ -38,15 +38,23 @@ integration depends on whether it imports cognee in-process or only talks to a s
 
 | Integration | Host Python floor | Why |
 |---|---|---|
-| Claude Code / Codex / Antigravity plugins | **3.9+** for the hooks; **3.10+** only for the uv-less fallback | Hooks are stdlib HTTP clients. In local mode they build a uv-managed **Python 3.12** venv for the Cognee server (fetching uv, and a ~66 MB standalone 3.12 when none is on the machine). Without uv the fallback builds the venv from the host `python3`, which then must be 3.10+; an older host is refused with `host_python_too_old_for_venv` in `hook.log` and a session-start message. |
+| Claude Code / Codex / Antigravity plugins | **3.9+** for the hooks; a **3.10–3.14** interpreter installed on the machine for local mode | Hooks are stdlib HTTP clients. In local mode the plugin builds the Cognee server's venv from a Python already installed — through uv if present (interpreter downloads disabled), else the stdlib `venv` with the newest `python3.x` on PATH — and installs the exact pinned `cognee` release. It downloads no installers or interpreters (plugin-directory policy). With no 3.10+ Python it refuses with `host_python_too_old_for_venv` in `hook.log` and a session-start message. |
 | OpenClaw | **3.9+** for the bootstrap script; **3.10+** only for the uv-less fallback | Same runtime scheme, driven from TypeScript. A refused fallback is recorded in `~/.cognee-plugin/.venv-error.json` and quoted in the gateway's "server did not become ready" warning. |
 | Hermes, LangGraph, CrewAI, Strands, Google ADK, Aider, Obsidian, chat-memory, Slack, Telegram, second-brain, web-widget | **3.10+** | `requires-python = ">=3.10"`; `pip`/`uv` refuse to install on 3.9. |
 | Dify, Dify SDK | **3.12+** | Dify plugin runtime requirement. |
 | Claude Agent SDK | **3.13+** | Follows `claude-agent-sdk`. |
 
 macOS's Xcode Command Line Tools install Python 3.9.6 as `/usr/bin/python3`. That is
-enough for the hook-based plugins and OpenClaw; for the SDK packages install a 3.10+
-interpreter (Homebrew, python.org or `uv python install 3.12`).
+enough to *run the hooks* of the Claude Code / Codex / Antigravity plugins and OpenClaw's
+bootstrap, and enough for **cloud mode** outright. **Local mode needs a 3.10–3.14
+interpreter installed as well**, because that is what Cognee itself requires and the
+plugins no longer download one: install it with Homebrew, python.org, pyenv or
+`uv python install 3.12` (any name on PATH works — the plugins look for `python3.14` …
+`python3.10` before `python3`). With none available a session starts with a message
+that begins *"Cognee requires Python 3.10 or newer"*, the status line shows
+`✕ (cognee_needs_python_3_10)`, and `doctor.py`'s `Runtime Python` row says
+`MISSING`; all three clear on the first session after an interpreter is installed.
+The SDK packages need the 3.10+ interpreter for the same reason.
 
 ## Extraction models and authentication
 

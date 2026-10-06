@@ -103,19 +103,45 @@ _LAZY_BOOTSTRAP = os.environ.get("COGNEE_LAZY_BOOTSTRAP", "1").strip().lower() n
 )
 
 # --- Self-managed cognee install ---------------------------------------------
-# uv is kept self-contained under ~/.cognee-plugin so we never touch the user's
-# Python or PATH. A uv-managed Python guarantees a cognee-compatible runtime
-# (cognee requires 3.10-3.14) regardless of what's installed on the machine.
-# The hooks themselves need only a stdlib python3 of 3.9+ (see SDK-617): the
-# host interpreter never imports cognee, it only builds and talks to the venv.
+# The runtime venv is built ONLY from tooling already on the machine. The plugin
+# never downloads an installer script or an interpreter: the Claude Code plugin
+# directory admits only code that is in the reviewed repository or a package
+# pinned to an exact version, so the one thing fetched at setup is
+# ``cognee==<_PINNED_COGNEE_VERSION>`` from PyPI. uv is used when the user
+# already has it (fast resolver, and it can pick any suitable interpreter on
+# the machine); otherwise the stdlib ``venv`` + pip build from a host Python
+# 3.10+ (cognee requires 3.10-3.14). Nothing touches the user's PATH or shell
+# profile. The hooks themselves need only a stdlib python3 of 3.9+ (SDK-617):
+# the host interpreter never imports cognee, it only builds and talks to the venv.
 _UV_DIR = _GLOBAL_STATE_DIR / "uv"
 _UV_BIN = _UV_DIR / ("uv.exe" if os.name == "nt" else "uv")
+# Where earlier plugin versions let uv store a downloaded interpreter. Still
+# handed to uv as a *discovery* location so a machine that already has one keeps
+# using it; downloads themselves are disabled (UV_PYTHON_DOWNLOADS=never).
 _UV_PYTHON_DIR = _GLOBAL_STATE_DIR / "python"
-_UV_INSTALL_URL = "https://astral.sh/uv/install.sh"
-_PINNED_PYTHON = os.environ.get("COGNEE_PLUGIN_PYTHON", "") or "3.12"
-# Floor for the HOST interpreter, enforced only on the uv-less fallback, which
-# builds the runtime venv from sys.executable and so inherits its version.
+# The interpreter range cognee itself supports (its ``requires-python``): both
+# the uv request and the stdlib fallback are bounded by it, so a too-new Python
+# (which cognee's wheels would refuse) is skipped the same as a too-old one.
 _FALLBACK_VENV_MIN_PYTHON = (3, 10)
+_FALLBACK_VENV_MAX_PYTHON = (3, 14)
+# A version *range*, not a single minor: lets uv pick whichever cognee-compatible
+# interpreter is already installed instead of insisting on one it would have to
+# fetch. COGNEE_PLUGIN_PYTHON overrides it (a version, a name, or a path).
+_PINNED_PYTHON = os.environ.get("COGNEE_PLUGIN_PYTHON", "") or ">={}.{},<{}.{}".format(
+    *_FALLBACK_VENV_MIN_PYTHON, _FALLBACK_VENV_MAX_PYTHON[0], _FALLBACK_VENV_MAX_PYTHON[1] + 1
+)
+# Interpreter names probed on PATH for that fallback, newest first, when the
+# python3 that launched the hook is itself too old: macOS ships 3.9 as
+# /usr/bin/python3 while a Homebrew or python.org 3.12 sits beside it.
+_HOST_PYTHON_CANDIDATES = (
+    "python3.14",
+    "python3.13",
+    "python3.12",
+    "python3.11",
+    "python3.10",
+    "python3",
+    "python",
+)
 # Written when that fallback is refused; read by the next SessionStart so the
 # refusal reaches the user as a systemMessage (the worker that hits it runs
 # detached, with nothing it prints visible). Cleared once a venv is ready.
@@ -181,11 +207,56 @@ _VENV_INSTALL_POLL_SECONDS = 0.5
 
 
 def _find_uv() -> str:
-    """Locate uv: prefer our self-managed copy, then anything on PATH."""
+    """Locate a uv that is already on the machine: the copy an earlier plugin
+    version left under ~/.cognee-plugin, then anything on PATH. Never fetched."""
     if _UV_BIN.exists():
         return str(_UV_BIN)
     found = shutil.which("uv")
     return found or ""
+
+
+def _host_python_version(python: str) -> tuple:
+    """``(major, minor)`` of an interpreter on disk, or ``()`` if it cannot run."""
+    try:
+        out = subprocess.run(
+            [python, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        ).stdout.strip()
+        major, minor = out.split(".")
+        return (int(major), int(minor))
+    except Exception:
+        return ()
+
+
+def _cognee_supports(version: tuple) -> bool:
+    """Whether a ``(major, minor)`` falls inside cognee's supported range."""
+    if not version:
+        return False
+    return _FALLBACK_VENV_MIN_PYTHON <= tuple(version[:2]) <= _FALLBACK_VENV_MAX_PYTHON
+
+
+def _find_host_python() -> str:
+    """A Python inside cognee's supported range (3.10-3.14) already installed on
+    this machine, or '' when there is none.
+
+    Used by the stdlib ``venv`` fallback. The interpreter running this hook is
+    tried first (no subprocess), then the versioned names on PATH, newest first.
+    Nothing is downloaded: a miss is reported by ``_refuse_fallback_venv``.
+    """
+    if _cognee_supports(tuple(sys.version_info[:2])):
+        return sys.executable
+    seen = {sys.executable}
+    for name in _HOST_PYTHON_CANDIDATES:
+        found = shutil.which(name)
+        if not found or found in seen:
+            continue
+        seen.add(found)
+        if _cognee_supports(_host_python_version(found)):
+            return found
+    return ""
 
 
 def _host_python_label() -> str:
@@ -194,22 +265,25 @@ def _host_python_label() -> str:
 
 
 def _refuse_fallback_venv() -> None:
-    """Record why the uv-less fallback will not build the runtime venv.
+    """Record why no runtime venv could be built: no Python 3.10+ on the machine.
 
     Three readers: hook.log (forensics), this process's stderr (the bootstrap
     log when detached, the terminal when not), and the marker the next
     SessionStart turns into a systemMessage via ``_apply_host_python_warning``.
     """
     message = (
-        "Cognee Memory: cannot build the local Cognee runtime. uv is unavailable, and the "
-        "fallback would build the venv from {}, but that needs Python 3.10 or newer. Install "
-        "uv (https://docs.astral.sh/uv/) or a Python 3.10+ python3, then start a new "
-        "session.".format(_host_python_label())
+        "Cognee Memory: cannot start the local Cognee server. Cognee requires Python 3.10 or "
+        "newer (up to 3.14), and no such interpreter is installed on this machine: the hook "
+        "runs under {}, none of {} on PATH qualifies, and the plugin does not download "
+        "interpreters. Install Python 3.10+ (python.org, Homebrew, or `uv python install "
+        "3.12` if you use uv), then start a new session. Cloud mode (COGNEE_BASE_URL) has no "
+        "such requirement.".format(_host_python_label(), "/".join(_HOST_PYTHON_CANDIDATES[:5]))
     )
     detail = {
         "python": sys.executable,
         "version": "{}.{}.{}".format(*sys.version_info[:3]),
         "required": "{}.{}".format(*_FALLBACK_VENV_MIN_PYTHON),
+        "supported": "{}.{}-{}.{}".format(*_FALLBACK_VENV_MIN_PYTHON, *_FALLBACK_VENV_MAX_PYTHON),
     }
     hook_log("host_python_too_old_for_venv", detail)
     print(message, file=sys.stderr)
@@ -252,29 +326,6 @@ def _apply_host_python_warning(output: dict) -> dict:
     top = str(result.get("systemMessage") or "").strip()
     result["systemMessage"] = "{}\n\n{}".format(top, message) if top else message
     return result
-
-
-def _install_uv() -> str:
-    """Install the standalone uv binary into ~/.cognee-plugin/uv (no PATH edits)."""
-    try:
-        _UV_DIR.mkdir(parents=True, exist_ok=True)
-        env = os.environ.copy()
-        # UV_UNMANAGED_INSTALL drops the binary in the given dir without editing
-        # shell profiles or managing updates — exactly what we want.
-        env["UV_UNMANAGED_INSTALL"] = str(_UV_DIR)
-        subprocess.run(
-            ["sh", "-c", f"curl -LsSf {_UV_INSTALL_URL} | sh"],
-            env=env,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if _UV_BIN.exists():
-            return str(_UV_BIN)
-    except Exception as exc:
-        hook_log("uv_install_failed", {"error": str(exc)[:300]})
-    return ""
 
 
 def _venv_cognee_version() -> str:
@@ -470,11 +521,17 @@ def ensure_cognee_installed(timeout: float = _INSTALL_TIMEOUT_SECONDS) -> bool:
                 return True
             hook_log("cognee_extras_missing_at_pin", {"missing": missing_extras})
 
-        uv = _find_uv() or _install_uv()
+        uv = _find_uv()
         venv_present = _VENV_PYTHON.exists()
+        installed_via_uv = False
 
         if uv:
             env = os.environ.copy()
+            # uv must never fetch an interpreter: the runtime is built from what
+            # is already installed (no binaries downloaded at setup). The install
+            # dir is passed only so an interpreter an earlier plugin version put
+            # there is still discovered.
+            env["UV_PYTHON_DOWNLOADS"] = "never"
             env.setdefault("UV_PYTHON_INSTALL_DIR", str(_UV_PYTHON_DIR))
             try:
                 if not venv_present:
@@ -504,19 +561,24 @@ def ensure_cognee_installed(timeout: float = _INSTALL_TIMEOUT_SECONDS) -> bool:
                     text=True,
                     timeout=timeout,
                 )
+                installed_via_uv = True
             except Exception as exc:
                 hook_log("cognee_install_failed", {"via": "uv", "error": str(exc)[:300]})
-        elif not venv_present:
-            # Last-resort fallback: stdlib venv + pip. Slower, and the venv inherits
-            # this interpreter, so the host python3 must itself satisfy cognee's
-            # floor (3.10-3.14). The hooks run on any 3.9+, so check explicitly
-            # rather than build a venv cognee could never install into.
-            if sys.version_info < _FALLBACK_VENV_MIN_PYTHON:
+
+        if not installed_via_uv and not _VENV_PYTHON.exists():
+            # Fallback: stdlib venv + pip, from a Python 3.10+ already on the
+            # machine. Reached when there is no uv, or when uv could not find a
+            # suitable interpreter (it is not allowed to download one). The venv
+            # inherits the host interpreter, so cognee's floor (3.10-3.14) must
+            # hold for it; the hooks run on any 3.9+, so probe explicitly rather
+            # than build a venv cognee could never install into.
+            host_python = _find_host_python()
+            if not host_python:
                 _refuse_fallback_venv()
                 return False
             try:
                 subprocess.run(
-                    [sys.executable, "-m", "venv", str(_VENV_DIR)],
+                    [host_python, "-m", "venv", str(_VENV_DIR)],
                     check=True,
                     capture_output=True,
                     text=True,

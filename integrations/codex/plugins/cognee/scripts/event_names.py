@@ -190,6 +190,7 @@ EVENT_NAMES = {
     "hook:recall_guidance_absent": "recall.guidance_absent",
     "hook:recall_health_accounting_failed": "recall.health_accounting_failed",
     "hook:readable_datasets_refresh_failed": "datasets.readable_refresh_failed",
+    "hook:readable_datasets_refresh_deferred": "datasets.readable_refresh_deferred",
     "hook:recall_server_down": "recall.server_down",
     "hook:recall_skipped_not_ready": "recall.skipped_not_ready",
     "hook:run_exception": "run.exception",

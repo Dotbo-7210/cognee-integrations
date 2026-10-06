@@ -198,6 +198,7 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:prompt_watcher_log_open_failed` | `prompt.watcher_log_open_failed` |
 | `hook:prompt_watcher_stop_unlink_failed` | `prompt.watcher_stop_unlink_failed` |
 | `hook:readable_datasets_refresh_failed` | `datasets.readable_refresh_failed` |
+| `hook:readable_datasets_refresh_deferred` | `datasets.readable_refresh_deferred` |
 | `hook:recall_audit_write_failed` | `recall.audit_write_failed` |
 | `hook:recall_auth_rejected` | `recall.auth_rejected` |
 | `hook:recall_breaker_open` | `recall.breaker_open` |
