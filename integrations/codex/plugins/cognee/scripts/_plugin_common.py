@@ -1275,7 +1275,15 @@ def _buffer_lock():
             os.close(fd)
             acquired = True
             break
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
+            # FileExistsError: held. PermissionError: held too, on Windows. A
+            # lock file its holder has just unlinked stays "delete pending" for
+            # as long as any other waiter still has a handle on it (its own
+            # exists()/stat() probe), and in that window O_CREAT|O_EXCL fails
+            # with "access denied" rather than "exists". Treating that as an
+            # error fell open without the lock and lost the very update the
+            # mutex exists for (one of eight concurrent appends on CI). It is
+            # a busy signal: wait and retry like any other contention.
             if time.monotonic() >= deadline:
                 hook_log("buffer_lock_timeout", {})
                 break

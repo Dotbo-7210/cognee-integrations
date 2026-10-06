@@ -48,6 +48,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
   `MISSING - Cognee needs Python 3.10-3.14`. All three clear on the first session after
   an interpreter is installed.
 
+### Fixed
+- **Warm-up buffer mutex lost an append on Windows.** `_buffer_lock` treated a
+  `PermissionError` from `O_CREAT|O_EXCL` as a broken lock and fell open without it.
+  On Windows that error is what a lock file in the *delete-pending* window answers
+  with (the holder unlinked it while another waiter still had a stat handle on it), so
+  under contention one writer skipped the mutex and clobbered another's entry — the
+  `test_concurrent_appends_do_not_lose_entries` failure on the Windows CI runner. It is
+  now treated as a busy signal and retried until the existing deadline.
+
 ### Removed
 - `_install_uv()` and the `https://astral.sh/uv/install.sh` constant. uv found under
   `~/.cognee-plugin/uv` from an earlier plugin version, or on PATH, is still used.
