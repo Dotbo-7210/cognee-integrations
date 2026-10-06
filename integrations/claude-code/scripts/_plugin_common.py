@@ -918,6 +918,11 @@ def list_writable_datasets(user_id: str = "", *, timeout: float = 15.0) -> dict:
 
 _READABLE_DATASETS_CACHE = _PLUGIN_DIR / "readable-datasets.json"
 _READABLE_DATASETS_TTL_DEFAULT = 300.0
+# After a refresh fails (timeout, unreachable), no retry before this many
+# seconds (COGNEE_DATASETS_CACHE_RETRY). Without it a stale cache on a slow
+# server was re-fetched on every eligible prompt, each paying the full
+# listing timeout for a hint that is decoration.
+_READABLE_DATASETS_RETRY_DEFAULT = 120.0
 
 
 def cross_dataset_search_command() -> str:
@@ -949,8 +954,11 @@ def cached_readable_datasets(
     A listing younger than ``max_age`` seconds (``COGNEE_DATASETS_CACHE_TTL``,
     default 300) is served as-is. Otherwise, when ``refresh`` is allowed, one
     bounded ``list_readable_datasets`` call rewrites the cache; a refresh that
-    fails falls back to the stale rows rather than to nothing. Never raises:
-    the hint is decoration on the recall path.
+    fails falls back to the stale rows rather than to nothing, and records the
+    failure so the next ``COGNEE_DATASETS_CACHE_RETRY`` seconds (default 120)
+    serve the stale rows without another attempt — on a loaded server every
+    eligible prompt used to re-pay the listing timeout. Never raises: the hint
+    is decoration on the recall path.
     """
     service_url = service_url or _local_api_url()
     key = _readable_datasets_cache_key(service_url, _api_key())
@@ -970,10 +978,34 @@ def cached_readable_datasets(
             return rows
     if not refresh:
         return rows or []
+    # Backoff: a recent failed refresh for this same server/identity means the
+    # stale rows (or nothing) are the answer for now, not another timeout.
+    if same_identity:
+        retry_after = _float_env("COGNEE_DATASETS_CACHE_RETRY", _READABLE_DATASETS_RETRY_DEFAULT)
+        try:
+            since_failure = time.time() - float(cached.get("failed_at") or 0)
+        except (TypeError, ValueError):
+            since_failure = float("inf")
+        if 0 <= since_failure < retry_after:
+            hook_log(
+                "readable_datasets_refresh_deferred",
+                {"retry_in": round(retry_after - since_failure, 1)},
+            )
+            return rows or []
     try:
         fresh = list_readable_datasets(timeout=timeout)
     except Exception as exc:
         hook_log("readable_datasets_refresh_failed", {"error": str(exc)[:200]})
+        fetched_at = cached.get("fetched_at") if same_identity else 0
+        _write_json_file(
+            _READABLE_DATASETS_CACHE,
+            {
+                "key": key,
+                "fetched_at": fetched_at or 0,
+                "datasets": rows or [],
+                "failed_at": time.time(),
+            },
+        )
         return rows or []
     _write_json_file(
         _READABLE_DATASETS_CACHE,
@@ -1820,7 +1852,7 @@ def read_turn_count(session_id: str) -> int:
         return 0
 
 
-IMPROVE_COOLDOWN_DEFAULT_SECONDS = 1800.0
+IMPROVE_COOLDOWN_DEFAULT_SECONDS = 5400.0
 
 
 def improve_cooldown_seconds() -> float:

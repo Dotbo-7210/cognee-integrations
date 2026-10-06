@@ -7,6 +7,17 @@ package version.
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.4]
+
+### Changed
+- **Per-prompt readiness probe sized for a loaded cloud tenant.** Gateway logs from a
+  production tenant showed half of the 1 s readiness probes timing out against a
+  server whose normal answer takes 0.3 s. `COGNEE_READY_PROBE_TIMEOUT` is now `3.0`
+  (was `1.0`). A ceiling, not a cost: a fast server answers exactly as before.
+- **Idle/auto improves of one session run at most every 90 minutes.**
+  `COGNEE_IMPROVE_COOLDOWN` defaults to `5400` (was `1800`). The session-end final
+  sync ignores the cooldown as before.
+
 ## [1.6.3]
 
 ### Added

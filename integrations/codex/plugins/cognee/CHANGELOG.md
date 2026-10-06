@@ -10,6 +10,32 @@ is the cache key and semver record, bumped on each release, not the update trigg
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.5]
+
+### Changed
+- **Per-prompt timeouts sized for a loaded cloud tenant.** Gateway logs from a
+  production tenant showed the plugin giving up on requests the server would have
+  answered: half of the readiness probes past 1 s, two thirds of recalls past 12 s,
+  with normal completions at 0.3 s and 8 s. The defaults were tuned for localhost.
+  `COGNEE_READY_PROBE_TIMEOUT` is now `3.0` (was `1.0`) and `COGNEE_RECALL_BUDGET`
+  is `20` (was `12`). Ceilings, not costs: a fast server answers exactly as before,
+  a slow one stops producing empty recalls and false "not responding" verdicts.
+- **Idle/auto improves of one session run at most every 90 minutes.**
+  `COGNEE_IMPROVE_COOLDOWN` defaults to `5400` (was `1800`). The session-end final
+  sync, the explicit sync skill and the dataset-switch sync still ignore the
+  cooldown.
+
+### Fixed
+- **The dataset hint no longer re-pays a failed listing on every prompt.** The
+  readable-datasets listing behind the hint was served from a five-minute cache,
+  but a refresh that failed left the cache stale and was retried on the next
+  eligible prompt, each attempt paying the full 2 s timeout — on a tenant where
+  that call times out most of the time, most hint-bearing prompts did. A failed
+  refresh is now recorded and the stale rows (or nothing) serve the hint without a
+  network call for `COGNEE_DATASETS_CACHE_RETRY` seconds (default `120`); a
+  successful refresh clears it. The backoff is per server and identity, like the
+  cache itself. New hook event `readable_datasets_refresh_deferred`.
+
 ## [1.7.4]
 
 ### Added
